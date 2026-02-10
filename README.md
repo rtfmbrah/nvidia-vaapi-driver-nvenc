@@ -6,32 +6,6 @@ This project currently provides:
 - NVDEC-based VA-API decode (upstream behavior).
 - NVENC-based VA-API encode for H.264/HEVC entrypoints (`EncSlice`/`EncSliceLP`).
 
-## Project status
-
-- Decode path: usable and close to upstream behavior.
-- Encode path: functional, but still under active tuning.
-- Wayland + Electron/Chromium game-window capture can still show visual artifacts on some setups.
-
-## Features
-
-### Decode
-
-Decode capabilities follow the upstream NVDEC implementation and GPU support matrix.
-
-### Encode
-
-Implemented VA-API encode profiles:
-- H.264: `ConstrainedBaseline`, `Main`, `High`
-- HEVC: `Main`, `Main10`
-
-Implemented VA-API encode features:
-- Entrypoints: `VAEntrypointEncSlice`, `VAEntrypointEncSliceLP`
-- Rate control: `CBR`, `VBR`, `CQP`
-- Packed headers: sequence/picture/slice
-- Dynamic reconfigure support (resolution/rate-control changes where possible)
-
-Current encode implementation uses host-memory staging (copy path), not full zero-copy.
-
 ## Requirements
 
 - NVIDIA proprietary driver with NVENC/NVDEC support
@@ -51,12 +25,6 @@ meson setup build_noccache --wipe
 meson compile -C build_noccache
 sudo meson install -C build_noccache
 ```
-
-The installed driver filename remains:
-- `nvidia_drv_video.so`
-
-And libva driver name remains:
-- `LIBVA_DRIVER_NAME=nvidia`
 
 ## Testing
 
@@ -92,36 +60,6 @@ vainfo
 ```
 
 You should see `VA-API NVDEC/NVENC driver` and encode entrypoints for H.264/HEVC.
-
-Recommended Vesktop launch on Wayland (global install):
-
-```sh
-LIBVA_DRIVER_NAME=nvidia \
-LIBVA_DRM_DEVICE=/dev/dri/renderD128 \
-NVD_ENC_IO_DEPTH=2 \
-vesktop --disable-gpu-sandbox \
-  --ozone-platform=wayland \
-  --enable-webrtc-pipewire-capturer \
-  --use-gl=angle --use-angle=gl \
-  --enable-features=UseOzonePlatform,WaylandWindowDecorations,AcceleratedVideoEncoder,VaapiVideoEncoder,VaapiOnNvidiaGPUs,VaapiIgnoreDriverChecks
-```
-
-Desktop entry `Exec=` example:
-
-```ini
-Exec=env LIBVA_DRIVER_NAME=nvidia LIBVA_DRM_DEVICE=/dev/dri/renderD128 NVD_ENC_IO_DEPTH=2 vesktop --disable-gpu-sandbox --ozone-platform=wayland --enable-webrtc-pipewire-capturer --use-gl=angle --use-angle=gl --enable-features=UseOzonePlatform,WaylandWindowDecorations,AcceleratedVideoEncoder,VaapiVideoEncoder,VaapiOnNvidiaGPUs,VaapiIgnoreDriverChecks %U
-```
-
-### Local/dev override usage
-
-Use build output without installing:
-
-```sh
-LIBVA_DRIVERS_PATH=$PWD/build_noccache \
-LIBVA_DRIVER_NAME=nvidia \
-NVD_LOG=1 \
-vesktop
-```
 
 ## Runtime environment variables
 
@@ -167,8 +105,6 @@ vesktop
 
 ## Known issues and expectations
 
-- Wayland + Electron/Chromium game-window capture may show black horizontal tears on some GNOME/NVIDIA setups.
-- Full desktop capture can behave differently from game-window capture.
 - Some issues appear to be outside the driver (capture/import path), even when encode path is healthy.
 
 ## Troubleshooting quick checklist
@@ -177,17 +113,9 @@ vesktop
    - `vainfo`
 2. Enable driver logs:
    - `NVD_LOG=1`
-3. Verify fallback behavior:
-   - if you see `OpenH264`, client fell back to software encode
-   - if you see `HW encode context closed without output frames`, VAAPI encode context did not produce bitstream before teardown
-4. Compare X11 vs Wayland behavior:
+3. Compare X11 vs Wayland behavior:
    - artifacts only on one platform usually indicate capture-path differences, not pure encoder failure
 
 ## License
 
 This fork stays under the upstream MIT license. Keep `COPYING` in the repository and preserve upstream notices.
-
-If you merge code from other repositories:
-- confirm license compatibility first
-- keep attribution in commit history and documentation
-- add explicit notices if required by source licenses
