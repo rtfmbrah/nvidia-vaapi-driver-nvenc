@@ -93,6 +93,25 @@ vainfo
 
 You should see `VA-API NVDEC/NVENC driver` and encode entrypoints for H.264/HEVC.
 
+Recommended Vesktop launch on Wayland (global install):
+
+```sh
+LIBVA_DRIVER_NAME=nvidia \
+LIBVA_DRM_DEVICE=/dev/dri/renderD128 \
+NVD_ENC_IO_DEPTH=2 \
+vesktop --disable-gpu-sandbox \
+  --ozone-platform=wayland \
+  --enable-webrtc-pipewire-capturer \
+  --use-gl=angle --use-angle=gl \
+  --enable-features=UseOzonePlatform,WaylandWindowDecorations,AcceleratedVideoEncoder,VaapiVideoEncoder,VaapiOnNvidiaGPUs,VaapiIgnoreDriverChecks
+```
+
+Desktop entry `Exec=` example:
+
+```ini
+Exec=env LIBVA_DRIVER_NAME=nvidia LIBVA_DRM_DEVICE=/dev/dri/renderD128 NVD_ENC_IO_DEPTH=2 vesktop --disable-gpu-sandbox --ozone-platform=wayland --enable-webrtc-pipewire-capturer --use-gl=angle --use-angle=gl --enable-features=UseOzonePlatform,WaylandWindowDecorations,AcceleratedVideoEncoder,VaapiVideoEncoder,VaapiOnNvidiaGPUs,VaapiIgnoreDriverChecks %U
+```
+
 ### Local/dev override usage
 
 Use build output without installing:
@@ -111,6 +130,9 @@ vesktop
 - `NVD_LOG`
   - `1`: log to stdout
   - any other value: append logs to the given file path
+- HW encode health lines are printed to stderr even when `NVD_LOG` is unset:
+  - `"[vaapi-nvenc] INFO: HW encode active (...)"` on first output frame
+  - `"[vaapi-nvenc] WARN: HW encode context closed without output frames (...)"` when encode failed to produce output before teardown
 - `NVD_BACKEND`
   - `direct` (default) or `egl`
 - `NVD_GPU`
@@ -119,6 +141,8 @@ vesktop
   - limit concurrent driver instances per process
 - `NVD_FORCE_INIT`
   - force init in environments where sandbox detection would normally skip it
+- `NVD_ENC_IO_DEPTH`
+  - number of NVENC input/bitstream buffer slots to use (default `1`, valid `1..4`)
 
 ### Encode debug/testing
 
@@ -134,6 +158,12 @@ vesktop
   - stricter map/unmap staging path for debugging synchronization behavior
 - `NVD_ENC_FORCE_IDR_EVERY=<N>`
   - force IDR every `N` frames (diagnostic only, not recommended for normal usage)
+- `NVD_ENC_STARTUP_IDR_FRAMES=<N>`
+  - force IDR for the first `N` successfully produced frames of each encode context (default `16`)
+- `NVD_ENC_RECONFIG_MIN_MS=<N>`
+  - minimum interval (ms) between non-resolution encoder reconfigurations (default `800`)
+- `NVD_ENC_VISIBLE_RECONFIG=1`
+  - enable visible-rect-based resolution reconfigure (disabled by default for stability)
 
 ## Known issues and expectations
 
@@ -148,7 +178,8 @@ vesktop
 2. Enable driver logs:
    - `NVD_LOG=1`
 3. Verify fallback behavior:
-   - check app logs for software encoder fallback (`OpenH264`, etc.)
+   - if you see `OpenH264`, client fell back to software encode
+   - if you see `HW encode context closed without output frames`, VAAPI encode context did not produce bitstream before teardown
 4. Compare X11 vs Wayland behavior:
    - artifacts only on one platform usually indicate capture-path differences, not pure encoder failure
 

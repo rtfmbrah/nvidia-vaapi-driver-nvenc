@@ -17,3 +17,4 @@ meson.build.user
 build/
 build_*/
 *.log
+.vscode/

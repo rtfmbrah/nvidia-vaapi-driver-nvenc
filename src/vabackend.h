@@ -18,6 +18,7 @@
 #define SURFACE_QUEUE_SIZE 16
 #define MAX_IMAGE_COUNT 64
 #define MAX_PROFILES 32
+#define NVENC_MAX_IO_BUFFERS 4
 
 typedef struct {
     void        *buf;
@@ -219,8 +220,10 @@ typedef struct _NVContext
     bool                firstKeyframeValid;
     // encode state (valid when mode == NV_CONTEXT_ENCODE)
     void                *nvencEncoder;
-    NV_ENC_INPUT_PTR    nvencInputBuffer;
-    NV_ENC_OUTPUT_PTR   nvencOutputBuffer;
+    NV_ENC_INPUT_PTR    nvencInputBuffers[NVENC_MAX_IO_BUFFERS];
+    NV_ENC_OUTPUT_PTR   nvencOutputBuffers[NVENC_MAX_IO_BUFFERS];
+    uint32_t            nvencIoBufferCount;
+    uint32_t            nvencIoBufferIndex;
     GUID                encCodecGuid;
     GUID                encProfileGuid;
     GUID                encPresetGuid;
@@ -241,6 +244,11 @@ typedef struct _NVContext
     uint8_t             *encLastFrameData;
     size_t              encLastFrameSize;
     int                 encLastFrameValid;
+    uint64_t            encLastReconfigureNs;
+    uint32_t            encStartupIdrLeft;
+    uint32_t            encNeedMoreInputStreak;
+    uint32_t            encOutputFrameCount;
+    uint32_t            encLastHealthLogFrame;
 } NVContext;
 
 typedef struct

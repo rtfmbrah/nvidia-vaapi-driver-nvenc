@@ -83,6 +83,14 @@ if ! sh -c "$VAINFO_CMD" >"$TMP_OUT" 2>&1; then
     fi
 fi
 
+DRIVER_LINE=$(grep -m1 -E 'Driver version:' "$TMP_OUT" || true)
+if [ -n "$DRIVER_LINE" ]; then
+    echo "INFO: $DRIVER_LINE"
+    if ! printf '%s\n' "$DRIVER_LINE" | grep -qi 'NVENC'; then
+        echo "WARN: loaded VAAPI driver line does not mention NVENC"
+    fi
+fi
+
 if ! grep -Eq 'VAEntrypointEncSlice(LP)?' "$TMP_OUT"; then
     cat "$TMP_OUT"
     echo "FAIL: no VAAPI encode entrypoints found"
@@ -94,6 +102,8 @@ if ! grep -Eq 'VAProfileH264[^:]*:[[:space:]]*VAEntrypointEncSlice(LP)?' "$TMP_O
     echo "FAIL: H.264 VAAPI encode entrypoint not found"
     exit 1
 fi
+H264_ENC_COUNT=$(grep -Ec 'VAProfileH264[^:]*:[[:space:]]*VAEntrypointEncSlice(LP)?' "$TMP_OUT" || true)
+echo "INFO: H.264 encode entrypoints detected: $H264_ENC_COUNT"
 
 if grep -Eq 'VAProfileHEVC[^:]*:[[:space:]]*VAEntrypointEncSlice(LP)?' "$TMP_OUT"; then
     echo "PASS: HEVC encode entrypoint detected"
