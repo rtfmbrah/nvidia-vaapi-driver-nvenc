@@ -119,6 +119,8 @@ vesktop
   - limit concurrent driver instances per process
 - `NVD_FORCE_INIT`
   - force init in environments where sandbox detection would normally skip it
+- `NVD_ENC_IO_DEPTH`
+  - number of NVENC input/bitstream buffer slots to use (default `1`, valid `1..4`)
 
 ### Encode debug/testing
 
@@ -134,6 +136,12 @@ vesktop
   - stricter map/unmap staging path for debugging synchronization behavior
 - `NVD_ENC_FORCE_IDR_EVERY=<N>`
   - force IDR every `N` frames (diagnostic only, not recommended for normal usage)
+- `NVD_ENC_STARTUP_IDR_FRAMES=<N>`
+  - force IDR for the first `N` successfully produced frames of each encode context (default `16`)
+- `NVD_ENC_RECONFIG_MIN_MS=<N>`
+  - minimum interval (ms) between non-resolution encoder reconfigurations (default `300`)
+- `NVD_ENC_VISIBLE_RECONFIG=1`
+  - enable visible-rect-based resolution reconfigure (disabled by default for stability)
 
 ## Known issues and expectations
 
