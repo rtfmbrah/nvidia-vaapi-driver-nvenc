@@ -92,8 +92,9 @@ static int g_disableDecoder = 0;
 static int g_encStrictMode = 0;
 static uint32_t g_encForceIdrEvery = 0;
 static uint32_t g_encStartupIdrFrames = 4;
-static uint32_t g_encReconfigureMinMs = 300;
+static uint32_t g_encReconfigureMinMs = 800;
 static int g_encVisibleReconfigure = 0;
+static int g_warnedVp9Av1NoRtformat = 0;
 static pthread_mutex_t g_encDebugMutex = PTHREAD_MUTEX_INITIALIZER;
 static int g_encDebugInitDone = 0;
 static int g_encDebugEnabled = 0;
@@ -301,7 +302,7 @@ static void init() {
     }
     g_encStartupIdrFrames = parseEnvU32("NVD_ENC_STARTUP_IDR_FRAMES", 16);
     LOG("NVD_ENC_STARTUP_IDR_FRAMES=%u", g_encStartupIdrFrames);
-    g_encReconfigureMinMs = parseEnvU32("NVD_ENC_RECONFIG_MIN_MS", 300);
+    g_encReconfigureMinMs = parseEnvU32("NVD_ENC_RECONFIG_MIN_MS", 800);
     LOG("NVD_ENC_RECONFIG_MIN_MS=%u", g_encReconfigureMinMs);
     g_encVisibleReconfigure = envFlagEnabled("NVD_ENC_VISIBLE_RECONFIG");
     LOG("NVD_ENC_VISIBLE_RECONFIG=%d", g_encVisibleReconfigure);
@@ -1528,7 +1529,10 @@ static VAStatus nvCreateConfig(
                     cfg->surfaceFormat = cudaVideoSurfaceFormat_P016;
                     cfg->bitDepth = 10;
                 } else {
-                    LOG("Unable to determine surface type for VP9/AV1 codec due to no RTFormat specified.");
+                    if (!g_warnedVp9Av1NoRtformat) {
+                        LOG("Unable to determine surface type for VP9/AV1 codec due to no RTFormat specified.");
+                        g_warnedVp9Av1NoRtformat = 1;
+                    }
                 }
             }
         default:
@@ -1775,6 +1779,7 @@ static VAStatus nvCreateSurfaces2(
 
     CHECK_CUDA_RESULT_RETURN(cu->cuCtxPushCurrent(drv->cudaContext), VA_STATUS_ERROR_OPERATION_FAILED);
 
+    LOG("Creating %u surface(s): %ux%u format=%X", num_surfaces, width, height, format);
     for (uint32_t i = 0; i < num_surfaces; i++) {
         Object surfaceObject = allocateObject(drv, OBJECT_TYPE_SURFACE, sizeof(NVSurface));
         surfaces[i] = surfaceObject->id;
@@ -1799,7 +1804,6 @@ static VAStatus nvCreateSurfaces2(
         suf->contentValid = 0;
         suf->status = VASurfaceReady;
 
-        LOG("Creating surface %ux%u, format %X (%p)", width, height, format, suf);
     }
 
     CHECK_CUDA_RESULT_RETURN(cu->cuCtxPopCurrent(NULL), VA_STATUS_ERROR_OPERATION_FAILED);
@@ -1828,13 +1832,12 @@ static VAStatus nvDestroySurfaces(
 {
     NVDriver *drv = (NVDriver*) ctx->pDriverData;
 
+    LOG("Destroying %d surface(s)", num_surfaces);
     for (int i = 0; i < num_surfaces; i++) {
         NVSurface *surface = (NVSurface*) getObjectPtr(drv, OBJECT_TYPE_SURFACE, surface_list[i]);
         if (!surface) {
             return VA_STATUS_ERROR_INVALID_SURFACE;
         }
-
-        LOG("Destroying surface %d (%p)", surface->pictureIdx, surface);
 
         drv->backend->detachBackingImageFromSurface(drv, surface);
         free(surface->hostData);

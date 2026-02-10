@@ -139,7 +139,7 @@ vesktop
 - `NVD_ENC_STARTUP_IDR_FRAMES=<N>`
   - force IDR for the first `N` successfully produced frames of each encode context (default `16`)
 - `NVD_ENC_RECONFIG_MIN_MS=<N>`
-  - minimum interval (ms) between non-resolution encoder reconfigurations (default `300`)
+  - minimum interval (ms) between non-resolution encoder reconfigurations (default `800`)
 - `NVD_ENC_VISIBLE_RECONFIG=1`
   - enable visible-rect-based resolution reconfigure (disabled by default for stability)
 
