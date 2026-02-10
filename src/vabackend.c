@@ -744,22 +744,37 @@ static bool ensureSurfaceHostBuffer(NVSurface *surface)
     return true;
 }
 
+static int setU32IfChanged(uint32_t *dst, uint32_t value)
+{
+    if (*dst == value) {
+        return 0;
+    }
+    *dst = value;
+    return 1;
+}
+
 static void nvencSetBitrate(NVContext *nvCtx, uint32_t bitsPerSecond)
 {
     if (bitsPerSecond == 0) {
         return;
     }
     NV_ENC_RC_PARAMS *rc = &nvCtx->encConfig.rcParams;
-    if (rc->rateControlMode == NV_ENC_PARAMS_RC_CBR) {
-        rc->averageBitRate = bitsPerSecond;
-        rc->maxBitRate = bitsPerSecond;
-    } else {
-        rc->averageBitRate = bitsPerSecond;
-        if (rc->maxBitRate < bitsPerSecond) {
-            rc->maxBitRate = bitsPerSecond;
-        }
+    if (rc->rateControlMode == NV_ENC_PARAMS_RC_CONSTQP) {
+        return;
     }
-    nvCtx->encNeedsReconfigure = 1;
+    uint32_t avg = bitsPerSecond;
+    uint32_t max = bitsPerSecond;
+    if (rc->rateControlMode == NV_ENC_PARAMS_RC_CBR) {
+        max = bitsPerSecond;
+    } else {
+        max = rc->maxBitRate < bitsPerSecond ? bitsPerSecond : rc->maxBitRate;
+    }
+    int changed = 0;
+    changed |= setU32IfChanged(&rc->averageBitRate, avg);
+    changed |= setU32IfChanged(&rc->maxBitRate, max);
+    if (changed) {
+        nvCtx->encNeedsReconfigure = 1;
+    }
 }
 
 static void nvencSetFrameRate(NVContext *nvCtx, uint32_t fpsNum, uint32_t fpsDen)
@@ -770,26 +785,32 @@ static void nvencSetFrameRate(NVContext *nvCtx, uint32_t fpsNum, uint32_t fpsDen
     if (fpsDen == 0) {
         fpsDen = 1;
     }
-    nvCtx->encInitParams.frameRateNum = fpsNum;
-    nvCtx->encInitParams.frameRateDen = fpsDen;
-    nvCtx->encNeedsReconfigure = 1;
+    int changed = 0;
+    changed |= setU32IfChanged(&nvCtx->encInitParams.frameRateNum, fpsNum);
+    changed |= setU32IfChanged(&nvCtx->encInitParams.frameRateDen, fpsDen);
+    if (changed) {
+        nvCtx->encNeedsReconfigure = 1;
+    }
 }
 
 static void nvencSetGop(NVContext *nvCtx, uint32_t gopLength, uint32_t idrPeriod)
 {
     if (gopLength > 0) {
-        nvCtx->encConfig.gopLength = gopLength;
-        nvCtx->encNeedsReconfigure = 1;
+        if (setU32IfChanged(&nvCtx->encConfig.gopLength, gopLength)) {
+            nvCtx->encNeedsReconfigure = 1;
+        }
     }
     if (!nvCtx->encIsHevc) {
         if (idrPeriod > 0) {
-            nvCtx->encConfig.encodeCodecConfig.h264Config.idrPeriod = idrPeriod;
-            nvCtx->encNeedsReconfigure = 1;
+            if (setU32IfChanged(&nvCtx->encConfig.encodeCodecConfig.h264Config.idrPeriod, idrPeriod)) {
+                nvCtx->encNeedsReconfigure = 1;
+            }
         }
     } else {
         if (idrPeriod > 0) {
-            nvCtx->encConfig.encodeCodecConfig.hevcConfig.idrPeriod = idrPeriod;
-            nvCtx->encNeedsReconfigure = 1;
+            if (setU32IfChanged(&nvCtx->encConfig.encodeCodecConfig.hevcConfig.idrPeriod, idrPeriod)) {
+                nvCtx->encNeedsReconfigure = 1;
+            }
         }
     }
 }
@@ -940,6 +961,7 @@ static VAStatus nvencReconfigureIfNeeded(NVDriver *drv, NVContext *nvCtx)
         return VA_STATUS_SUCCESS;
     }
     if (!drv->nvencFuncs.nvEncReconfigureEncoder) {
+        nvCtx->encNeedsReconfigure = 0;
         return VA_STATUS_SUCCESS;
     }
 
@@ -952,7 +974,12 @@ static VAStatus nvencReconfigureIfNeeded(NVDriver *drv, NVContext *nvCtx)
     NVENCSTATUS nvs = drv->nvencFuncs.nvEncReconfigureEncoder(nvCtx->nvencEncoder, &reconfig);
     if (nvs != NV_ENC_SUCCESS) {
         LOG("nvEncReconfigureEncoder failed: %s", nvencStatusStr(nvs));
-        return nvencToVaStatus(nvs);
+        /*
+         * Avoid failing every frame on repeating app-side control buffers.
+         * Keep previous active encoder configuration and continue.
+         */
+        nvCtx->encNeedsReconfigure = 0;
+        return VA_STATUS_SUCCESS;
     }
     nvCtx->encInitParams = reconfig.reInitEncodeParams;
     nvCtx->encInitParams.encodeConfig = &nvCtx->encConfig;
@@ -2437,22 +2464,30 @@ static VAStatus nvRenderPicture(
                                         avg = UINT32_MAX;
                                     }
                                     nvencSetBitrate(nvCtx, (uint32_t) avg);
-                                    nvCtx->encConfig.rcParams.maxBitRate = rc->bits_per_second;
+                                    if (setU32IfChanged(&nvCtx->encConfig.rcParams.maxBitRate, rc->bits_per_second)) {
+                                        nvCtx->encNeedsReconfigure = 1;
+                                    }
                                 } else {
                                     nvencSetBitrate(nvCtx, rc->bits_per_second);
                                 }
                             }
                             if (rc->max_qp > 0) {
-                                nvCtx->encConfig.rcParams.maxQP.qpInterB = rc->max_qp;
-                                nvCtx->encConfig.rcParams.maxQP.qpInterP = rc->max_qp;
-                                nvCtx->encConfig.rcParams.maxQP.qpIntra = rc->max_qp;
-                                nvCtx->encNeedsReconfigure = 1;
+                                int changed = 0;
+                                changed |= setU32IfChanged(&nvCtx->encConfig.rcParams.maxQP.qpInterB, rc->max_qp);
+                                changed |= setU32IfChanged(&nvCtx->encConfig.rcParams.maxQP.qpInterP, rc->max_qp);
+                                changed |= setU32IfChanged(&nvCtx->encConfig.rcParams.maxQP.qpIntra, rc->max_qp);
+                                if (changed) {
+                                    nvCtx->encNeedsReconfigure = 1;
+                                }
                             }
                             if (rc->min_qp > 0) {
-                                nvCtx->encConfig.rcParams.minQP.qpInterB = rc->min_qp;
-                                nvCtx->encConfig.rcParams.minQP.qpInterP = rc->min_qp;
-                                nvCtx->encConfig.rcParams.minQP.qpIntra = rc->min_qp;
-                                nvCtx->encNeedsReconfigure = 1;
+                                int changed = 0;
+                                changed |= setU32IfChanged(&nvCtx->encConfig.rcParams.minQP.qpInterB, rc->min_qp);
+                                changed |= setU32IfChanged(&nvCtx->encConfig.rcParams.minQP.qpInterP, rc->min_qp);
+                                changed |= setU32IfChanged(&nvCtx->encConfig.rcParams.minQP.qpIntra, rc->min_qp);
+                                if (changed) {
+                                    nvCtx->encNeedsReconfigure = 1;
+                                }
                             }
                         } else if (misc->type == VAEncMiscParameterTypeFrameRate &&
                                    buf->size >= sizeof(VAEncMiscParameterBuffer) + sizeof(VAEncMiscParameterFrameRate)) {
@@ -2608,26 +2643,50 @@ static VAStatus nvEndPicture(
             srcY = 0;
         }
 
-        /* Clear full destination frame first so padded regions are deterministic. */
-        for (uint32_t y = 0; y < encHeight; y++) {
-            memset(dst + ((size_t) y * dstPitch), 0x00, encWidth);
-        }
         uint8_t *dstUV = dst + ((size_t) encHeight * dstPitch);
-        for (uint32_t y = 0; y < (encHeight / 2U); y++) {
-            memset(dstUV + ((size_t) y * dstPitch), 0x80, encWidth);
-        }
 
         pthread_mutex_lock(&surface->mutex);
         const uint8_t *srcYBase = src + ((size_t) srcY * srcPitch) + (size_t) srcX;
-        for (uint32_t y = 0; y < copyHeight; y++) {
-            memcpy(dst + ((size_t) y * dstPitch),
-                   srcYBase + ((size_t) y * srcPitch),
-                   copyWidth);
-        }
         const uint8_t *srcUV = src + surface->hostYSize +
                                ((size_t) (srcY / 2U) * srcPitch) + (size_t) srcX;
-        for (uint32_t y = 0; y < (copyHeight / 2U); y++) {
-            memcpy(dstUV + ((size_t) y * dstPitch), srcUV + ((size_t) y * srcPitch), copyWidth);
+
+        if (srcX == 0 && srcY == 0 &&
+            copyWidth == encWidth && copyHeight == encHeight &&
+            srcPitch == dstPitch) {
+            /* Fast path for full-frame copies with matching pitches. */
+            memcpy(dst, src, (size_t) encHeight * dstPitch);
+            memcpy(dstUV, src + surface->hostYSize, ((size_t) encHeight / 2U) * dstPitch);
+        } else {
+            /* Copy luma/chroma payload first. */
+            for (uint32_t y = 0; y < copyHeight; y++) {
+                memcpy(dst + ((size_t) y * dstPitch),
+                       srcYBase + ((size_t) y * srcPitch),
+                       copyWidth);
+            }
+            for (uint32_t y = 0; y < (copyHeight / 2U); y++) {
+                memcpy(dstUV + ((size_t) y * dstPitch),
+                       srcUV + ((size_t) y * srcPitch),
+                       copyWidth);
+            }
+
+            /* Clear only uncovered padding regions to keep output deterministic. */
+            if (copyWidth < encWidth) {
+                size_t pad = (size_t) (encWidth - copyWidth);
+                for (uint32_t y = 0; y < copyHeight; y++) {
+                    memset(dst + ((size_t) y * dstPitch) + copyWidth, 0x00, pad);
+                }
+                for (uint32_t y = 0; y < (copyHeight / 2U); y++) {
+                    memset(dstUV + ((size_t) y * dstPitch) + copyWidth, 0x80, pad);
+                }
+            }
+            if (copyHeight < encHeight) {
+                for (uint32_t y = copyHeight; y < encHeight; y++) {
+                    memset(dst + ((size_t) y * dstPitch), 0x00, encWidth);
+                }
+                for (uint32_t y = (copyHeight / 2U); y < (encHeight / 2U); y++) {
+                    memset(dstUV + ((size_t) y * dstPitch), 0x80, encWidth);
+                }
+            }
         }
         pthread_mutex_unlock(&surface->mutex);
 
@@ -2752,6 +2811,18 @@ static VAStatus nvEndPicture(
             return nvencToVaStatus(nvs);
         }
 
+        if (nvs == NV_ENC_ERR_NEED_MORE_INPUT) {
+            codedBuf->codedSeg->status = 0;
+            codedBuf->codedSeg->size = 0;
+            codedBuf->codedSeg->next = NULL;
+
+            CHECK_CUDA_RESULT_RETURN(cu->cuCtxPopCurrent(NULL), VA_STATUS_ERROR_OPERATION_FAILED);
+            nvCtx->encFrameNum++;
+            nvCtx->encForceIdr = 0;
+            surface->status = VASurfaceReady;
+            return VA_STATUS_SUCCESS;
+        }
+
         NV_ENC_LOCK_BITSTREAM lockBS;
         memset(&lockBS, 0, sizeof(lockBS));
         lockBS.version = NV_ENC_LOCK_BITSTREAM_VER;
@@ -2803,7 +2874,10 @@ static VAStatus nvEndPicture(
             }
         }
 
-        drv->nvencFuncs.nvEncUnlockBitstream(nvCtx->nvencEncoder, nvCtx->nvencOutputBuffer);
+        nvs = drv->nvencFuncs.nvEncUnlockBitstream(nvCtx->nvencEncoder, nvCtx->nvencOutputBuffer);
+        if (nvs != NV_ENC_SUCCESS) {
+            LOG("nvEncUnlockBitstream failed: %s", nvencStatusStr(nvs));
+        }
 
         CHECK_CUDA_RESULT_RETURN(cu->cuCtxPopCurrent(NULL), VA_STATUS_ERROR_OPERATION_FAILED);
 
