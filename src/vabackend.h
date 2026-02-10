@@ -247,6 +247,8 @@ typedef struct _NVContext
     uint64_t            encLastReconfigureNs;
     uint32_t            encStartupIdrLeft;
     uint32_t            encNeedMoreInputStreak;
+    uint32_t            encOutputFrameCount;
+    uint32_t            encLastHealthLogFrame;
 } NVContext;
 
 typedef struct

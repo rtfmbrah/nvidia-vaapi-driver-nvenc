@@ -173,6 +173,20 @@ static int envFlagEnabled(const char *name)
     return 1;
 }
 
+#if defined(__GNUC__) && !defined(__clang__)
+__attribute__((format(gnu_printf, 2, 3)))
+#endif
+static void nvencHealthLog(const char *level, const char *msg, ...)
+{
+    va_list args;
+    fprintf(stderr, "[vaapi-nvenc] %s: ", level);
+    va_start(args, msg);
+    vfprintf(stderr, msg, args);
+    va_end(args);
+    fputc('\n', stderr);
+    fflush(stderr);
+}
+
 static void nvencDebugInitOnce(void)
 {
     pthread_mutex_lock(&g_encDebugMutex);
@@ -493,6 +507,11 @@ static void deleteObject(NVDriver *drv, VAGenericID id) {
 
 static bool destroyContext(NVDriver *drv, NVContext *nvCtx) {
     if (nvCtx->mode == NV_CONTEXT_ENCODE) {
+        if (nvCtx->encFrameNum > 0 && nvCtx->encOutputFrameCount == 0) {
+            nvencHealthLog("WARN",
+                           "HW encode context closed without output frames (%ux%u); client may fall back to software",
+                           (unsigned int) nvCtx->width, (unsigned int) nvCtx->height);
+        }
         CHECK_CUDA_RESULT_RETURN(cu->cuCtxPushCurrent(drv->cudaContext), false);
         if (nvCtx->nvencEncoder != NULL) {
             nvencDestroyIoBuffers(drv, nvCtx);
@@ -1897,6 +1916,8 @@ static VAStatus nvCreateContext(
         nvCtx->encLastFrameValid = 0;
         nvCtx->encStartupIdrLeft = g_encStartupIdrFrames;
         nvCtx->encNeedMoreInputStreak = 0;
+        nvCtx->encOutputFrameCount = 0;
+        nvCtx->encLastHealthLogFrame = 0;
         nvCtx->nvencIoBufferCount = parseEnvU32("NVD_ENC_IO_DEPTH", 1);
         if (nvCtx->nvencIoBufferCount == 0) {
             nvCtx->nvencIoBufferCount = 1;
@@ -3022,6 +3043,21 @@ static VAStatus nvEndPicture(
         }
 
         CHECK_CUDA_RESULT_RETURN(cu->cuCtxPopCurrent(NULL), VA_STATUS_ERROR_OPERATION_FAILED);
+
+        nvCtx->encOutputFrameCount++;
+        if (nvCtx->encOutputFrameCount == 1) {
+            nvencHealthLog("INFO",
+                           "HW encode active (%s %ux%u)",
+                           nvCtx->encIsHevc ? "HEVC" : "H264",
+                           (unsigned int) copyWidth, (unsigned int) copyHeight);
+            nvCtx->encLastHealthLogFrame = 1;
+        } else if (nvCtx->encOutputFrameCount >= nvCtx->encLastHealthLogFrame + 900U) {
+            nvencHealthLog("INFO",
+                           "HW encode still active (%s frames=%u)",
+                           nvCtx->encIsHevc ? "HEVC" : "H264",
+                           (unsigned int) nvCtx->encOutputFrameCount);
+            nvCtx->encLastHealthLogFrame = nvCtx->encOutputFrameCount;
+        }
 
         nvCtx->encFrameNum++;
         nvCtx->encForceIdr = 0;
