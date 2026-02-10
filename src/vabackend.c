@@ -11,9 +11,14 @@
 #include <malloc.h>
 #include <fcntl.h>
 #include <sys/param.h>
+#include <sys/stat.h>
+#include <limits.h>
+#include <errno.h>
 
 #include <va/va_backend.h>
 #include <va/va_drmcommon.h>
+#include <va/va_enc_h264.h>
+#include <va/va_enc_hevc.h>
 
 #include <drm_fourcc.h>
 
@@ -22,6 +27,7 @@
 #include <stdarg.h>
 
 #include <time.h>
+#include <dlfcn.h>
 
 #ifndef __has_builtin
 #define __has_builtin(x) 0
@@ -78,6 +84,20 @@ static enum {
     EGL, DIRECT
 } backend = DIRECT;
 
+#define NVENC_CODED_BUF_SIZE (4 * 1024 * 1024)
+#define NVENC_PITCH_ALIGN 64
+#define NVENC_HEIGHT_ALIGN 16
+
+static int g_encStrictMode = 0;
+static uint32_t g_encForceIdrEvery = 0;
+static pthread_mutex_t g_encDebugMutex = PTHREAD_MUTEX_INITIALIZER;
+static int g_encDebugInitDone = 0;
+static int g_encDebugEnabled = 0;
+static uint32_t g_encDebugMaxFrames = 120;
+static uint32_t g_encDebugStartFrame = 0;
+static uint32_t g_encDebugFrameIndex = 0;
+static char g_encDebugDir[PATH_MAX] = "/tmp/nvd-enc-debug";
+
 const NVFormatInfo formatsInfo[] =
 {
     [NV_FORMAT_NONE] = {0},
@@ -98,6 +118,110 @@ static NVFormat nvFormatFromVaFormat(uint32_t fourcc) {
         }
     }
     return NV_FORMAT_NONE;
+}
+
+static uint64_t fnv1a64_append(uint64_t h, const uint8_t *data, size_t len)
+{
+    const uint64_t prime = 1099511628211ULL;
+    for (size_t i = 0; i < len; i++) {
+        h ^= (uint64_t) data[i];
+        h *= prime;
+    }
+    return h;
+}
+
+static uint32_t parseEnvU32(const char *name, uint32_t fallback)
+{
+    const char *v = getenv(name);
+    if (v == NULL || v[0] == '\0') {
+        return fallback;
+    }
+    char *end = NULL;
+    unsigned long parsed = strtoul(v, &end, 10);
+    if (end == v || *end != '\0') {
+        return fallback;
+    }
+    if (parsed > UINT32_MAX) {
+        return UINT32_MAX;
+    }
+    return (uint32_t) parsed;
+}
+
+static void nvencDebugInitOnce(void)
+{
+    pthread_mutex_lock(&g_encDebugMutex);
+    if (g_encDebugInitDone) {
+        pthread_mutex_unlock(&g_encDebugMutex);
+        return;
+    }
+    g_encDebugInitDone = 1;
+
+    const char *enabled = getenv("NVD_ENC_DEBUG");
+    if (enabled == NULL || enabled[0] == '\0' || strcmp(enabled, "0") == 0) {
+        pthread_mutex_unlock(&g_encDebugMutex);
+        return;
+    }
+    g_encDebugEnabled = 1;
+    g_encDebugMaxFrames = parseEnvU32("NVD_ENC_DEBUG_MAX_FRAMES", 120);
+    g_encDebugStartFrame = parseEnvU32("NVD_ENC_DEBUG_START_FRAME", 0);
+
+    const char *dir = getenv("NVD_ENC_DEBUG_DIR");
+    if (dir != NULL && dir[0] != '\0') {
+        strncpy(g_encDebugDir, dir, sizeof(g_encDebugDir) - 1);
+        g_encDebugDir[sizeof(g_encDebugDir) - 1] = '\0';
+    }
+
+    if (mkdir(g_encDebugDir, 0775) != 0 && errno != EEXIST) {
+        LOG("ENCDBG: mkdir(%s) failed: %s", g_encDebugDir, strerror(errno));
+        g_encDebugEnabled = 0;
+    } else {
+        LOG("ENCDBG enabled dir=%s start_frame=%u max_frames=%u",
+            g_encDebugDir, g_encDebugStartFrame, g_encDebugMaxFrames);
+    }
+    pthread_mutex_unlock(&g_encDebugMutex);
+}
+
+static void nvencDebugDumpNV12(const char *path, const uint8_t *y, const uint8_t *uv, size_t pitch, uint32_t width, uint32_t height)
+{
+    FILE *f = fopen(path, "wb");
+    if (f == NULL) {
+        LOG("ENCDBG: failed to open %s: %s", path, strerror(errno));
+        return;
+    }
+    for (uint32_t row = 0; row < height; row++) {
+        fwrite(y + ((size_t) row * pitch), 1, width, f);
+    }
+    for (uint32_t row = 0; row < (height / 2U); row++) {
+        fwrite(uv + ((size_t) row * pitch), 1, width, f);
+    }
+    fclose(f);
+}
+
+static void nvencDebugDumpBytes(const char *path, const uint8_t *data, size_t size)
+{
+    FILE *f = fopen(path, "wb");
+    if (f == NULL) {
+        LOG("ENCDBG: failed to open %s: %s", path, strerror(errno));
+        return;
+    }
+    fwrite(data, 1, size, f);
+    fclose(f);
+}
+
+static int nvencDebugBuildPath(char *out, size_t outSize, const char *leaf)
+{
+    size_t dirLen = strnlen(g_encDebugDir, outSize);
+    size_t leafLen = strlen(leaf);
+    if (dirLen == 0 || dirLen >= outSize) {
+        return 0;
+    }
+    if (dirLen + 1 + leafLen + 1 > outSize) {
+        return 0;
+    }
+    memcpy(out, g_encDebugDir, dirLen);
+    out[dirLen] = '/';
+    memcpy(out + dirLen + 1, leaf, leafLen + 1);
+    return 1;
 }
 
 __attribute__ ((constructor))
@@ -131,6 +255,19 @@ static void init() {
         } else if (strncmp(nvdBackend, "egl", 6) == 0) {
             backend = EGL;
         }
+    }
+
+    const char *nvdEncStrict = getenv("NVD_ENC_STRICT");
+    if (nvdEncStrict != NULL && nvdEncStrict[0] != '\0' && strcmp(nvdEncStrict, "0") != 0) {
+        g_encStrictMode = 1;
+    }
+    if (g_encStrictMode) {
+        LOG("NVD_ENC_STRICT enabled");
+    }
+
+    g_encForceIdrEvery = parseEnvU32("NVD_ENC_FORCE_IDR_EVERY", 0);
+    if (g_encForceIdrEvery > 0) {
+        LOG("NVD_ENC_FORCE_IDR_EVERY=%u", g_encForceIdrEvery);
     }
 
 #ifdef __linux__
@@ -318,6 +455,30 @@ static void deleteObject(NVDriver *drv, VAGenericID id) {
 }
 
 static bool destroyContext(NVDriver *drv, NVContext *nvCtx) {
+    if (nvCtx->mode == NV_CONTEXT_ENCODE) {
+        CHECK_CUDA_RESULT_RETURN(cu->cuCtxPushCurrent(drv->cudaContext), false);
+        if (nvCtx->nvencEncoder != NULL) {
+            if (nvCtx->nvencInputBuffer != NULL) {
+                drv->nvencFuncs.nvEncDestroyInputBuffer(nvCtx->nvencEncoder, nvCtx->nvencInputBuffer);
+                nvCtx->nvencInputBuffer = NULL;
+            }
+            if (nvCtx->nvencOutputBuffer != NULL) {
+                drv->nvencFuncs.nvEncDestroyBitstreamBuffer(nvCtx->nvencEncoder, nvCtx->nvencOutputBuffer);
+                nvCtx->nvencOutputBuffer = NULL;
+            }
+            drv->nvencFuncs.nvEncDestroyEncoder(nvCtx->nvencEncoder);
+            nvCtx->nvencEncoder = NULL;
+        }
+        CHECK_CUDA_RESULT_RETURN(cu->cuCtxPopCurrent(NULL), false);
+        if (nvCtx->encLastFrameData != NULL) {
+            free(nvCtx->encLastFrameData);
+            nvCtx->encLastFrameData = NULL;
+            nvCtx->encLastFrameSize = 0;
+            nvCtx->encLastFrameValid = 0;
+        }
+        return true;
+    }
+
     CHECK_CUDA_RESULT_RETURN(cu->cuCtxPushCurrent(drv->cudaContext), false);
 
     LOG("Signaling resolve thread to exit");
@@ -344,6 +505,20 @@ static void deleteAllObjects(NVDriver *drv) {
         LOG("Found object %d or type %d", o->id, o->type);
         if (o->type == OBJECT_TYPE_CONTEXT) {
             destroyContext(drv, (NVContext*) o->obj);
+        } else if (o->type == OBJECT_TYPE_BUFFER) {
+            NVBuffer *buf = (NVBuffer*) o->obj;
+            if (buf->ptr != NULL && buf->ownsPtr) {
+                free(buf->ptr);
+            }
+            if (buf->codedData != NULL) {
+                free(buf->codedData);
+            }
+        } else if (o->type == OBJECT_TYPE_SURFACE) {
+            NVSurface *surface = (NVSurface*) o->obj;
+            if (surface->hostData != NULL) {
+                free(surface->hostData);
+                surface->hostData = NULL;
+            }
         }
         deleteObject(drv, o->id);
     END_FOR_EACH
@@ -397,6 +572,397 @@ static bool doesGPUSupportCodec(cudaVideoCodec codec, int bitDepth, cudaVideoChr
     return (videoDecodeCaps.bIsSupported == 1);
 }
 
+static const char *nvencStatusStr(NVENCSTATUS status)
+{
+    switch (status) {
+        case NV_ENC_SUCCESS: return "SUCCESS";
+        case NV_ENC_ERR_NO_ENCODE_DEVICE: return "NO_ENCODE_DEVICE";
+        case NV_ENC_ERR_UNSUPPORTED_DEVICE: return "UNSUPPORTED_DEVICE";
+        case NV_ENC_ERR_INVALID_ENCODERDEVICE: return "INVALID_ENCODERDEVICE";
+        case NV_ENC_ERR_INVALID_DEVICE: return "INVALID_DEVICE";
+        case NV_ENC_ERR_DEVICE_NOT_EXIST: return "DEVICE_NOT_EXIST";
+        case NV_ENC_ERR_INVALID_PTR: return "INVALID_PTR";
+        case NV_ENC_ERR_INVALID_EVENT: return "INVALID_EVENT";
+        case NV_ENC_ERR_INVALID_PARAM: return "INVALID_PARAM";
+        case NV_ENC_ERR_INVALID_CALL: return "INVALID_CALL";
+        case NV_ENC_ERR_OUT_OF_MEMORY: return "OUT_OF_MEMORY";
+        case NV_ENC_ERR_ENCODER_NOT_INITIALIZED: return "ENCODER_NOT_INITIALIZED";
+        case NV_ENC_ERR_UNSUPPORTED_PARAM: return "UNSUPPORTED_PARAM";
+        case NV_ENC_ERR_LOCK_BUSY: return "LOCK_BUSY";
+        case NV_ENC_ERR_NOT_ENOUGH_BUFFER: return "NOT_ENOUGH_BUFFER";
+        case NV_ENC_ERR_INVALID_VERSION: return "INVALID_VERSION";
+        case NV_ENC_ERR_MAP_FAILED: return "MAP_FAILED";
+        case NV_ENC_ERR_NEED_MORE_INPUT: return "NEED_MORE_INPUT";
+        case NV_ENC_ERR_ENCODER_BUSY: return "ENCODER_BUSY";
+        case NV_ENC_ERR_GENERIC: return "GENERIC";
+        default: return "UNKNOWN";
+    }
+}
+
+static VAStatus nvencToVaStatus(NVENCSTATUS status)
+{
+    switch (status) {
+        case NV_ENC_SUCCESS:
+            return VA_STATUS_SUCCESS;
+        case NV_ENC_ERR_OUT_OF_MEMORY:
+            return VA_STATUS_ERROR_ALLOCATION_FAILED;
+        case NV_ENC_ERR_INVALID_PARAM:
+        case NV_ENC_ERR_INVALID_PTR:
+            return VA_STATUS_ERROR_INVALID_PARAMETER;
+        case NV_ENC_ERR_ENCODER_NOT_INITIALIZED:
+            return VA_STATUS_ERROR_INVALID_CONTEXT;
+        case NV_ENC_ERR_NO_ENCODE_DEVICE:
+        case NV_ENC_ERR_UNSUPPORTED_DEVICE:
+            return VA_STATUS_ERROR_UNSUPPORTED_ENTRYPOINT;
+        default:
+            return VA_STATUS_ERROR_OPERATION_FAILED;
+    }
+}
+
+static bool isEncodeProfile(VAProfile profile)
+{
+    switch (profile) {
+        case VAProfileH264ConstrainedBaseline:
+        case VAProfileH264Main:
+        case VAProfileH264High:
+        case VAProfileHEVCMain:
+        case VAProfileHEVCMain10:
+            return true;
+        default:
+            return false;
+    }
+}
+
+static void appendProfileIfMissing(NVDriver *drv, VAProfile profile)
+{
+    for (int i = 0; i < drv->profileCount; i++) {
+        if (drv->profiles[i] == profile) {
+            return;
+        }
+    }
+
+    if (drv->profileCount >= MAX_PROFILES) {
+        LOG("Profile list full, cannot append profile %d", profile);
+        return;
+    }
+
+    drv->profiles[drv->profileCount++] = profile;
+}
+
+static bool profileToNvencGuids(VAProfile profile, GUID *codecGuid, GUID *profileGuid, int *isHevc)
+{
+    switch (profile) {
+        case VAProfileH264ConstrainedBaseline:
+            *codecGuid = NV_ENC_CODEC_H264_GUID;
+            *profileGuid = NV_ENC_H264_PROFILE_BASELINE_GUID;
+            *isHevc = 0;
+            return true;
+        case VAProfileH264Main:
+            *codecGuid = NV_ENC_CODEC_H264_GUID;
+            *profileGuid = NV_ENC_H264_PROFILE_MAIN_GUID;
+            *isHevc = 0;
+            return true;
+        case VAProfileH264High:
+            *codecGuid = NV_ENC_CODEC_H264_GUID;
+            *profileGuid = NV_ENC_H264_PROFILE_HIGH_GUID;
+            *isHevc = 0;
+            return true;
+        case VAProfileHEVCMain:
+            *codecGuid = NV_ENC_CODEC_HEVC_GUID;
+            *profileGuid = NV_ENC_HEVC_PROFILE_MAIN_GUID;
+            *isHevc = 1;
+            return true;
+        case VAProfileHEVCMain10:
+            *codecGuid = NV_ENC_CODEC_HEVC_GUID;
+            *profileGuid = NV_ENC_HEVC_PROFILE_MAIN10_GUID;
+            *isHevc = 1;
+            return true;
+        default:
+            return false;
+    }
+}
+
+static bool loadNvencFunctions(NVDriver *drv)
+{
+    typedef NVENCSTATUS (NVENCAPI *PFN_NvEncodeAPICreateInstance)(NV_ENCODE_API_FUNCTION_LIST *);
+
+    drv->nvencLib = dlopen("libnvidia-encode.so.1", RTLD_NOW);
+    if (!drv->nvencLib) {
+        LOG("Failed to load libnvidia-encode.so.1: %s", dlerror());
+        return false;
+    }
+
+    PFN_NvEncodeAPICreateInstance createInstance =
+        (PFN_NvEncodeAPICreateInstance) dlsym(drv->nvencLib, "NvEncodeAPICreateInstance");
+    if (!createInstance) {
+        LOG("Failed to find NvEncodeAPICreateInstance: %s", dlerror());
+        dlclose(drv->nvencLib);
+        drv->nvencLib = NULL;
+        return false;
+    }
+
+    memset(&drv->nvencFuncs, 0, sizeof(drv->nvencFuncs));
+    drv->nvencFuncs.version = NV_ENCODE_API_FUNCTION_LIST_VER;
+
+    NVENCSTATUS status = createInstance(&drv->nvencFuncs);
+    if (status != NV_ENC_SUCCESS) {
+        LOG("NvEncodeAPICreateInstance failed: %s", nvencStatusStr(status));
+        dlclose(drv->nvencLib);
+        drv->nvencLib = NULL;
+        return false;
+    }
+
+    drv->nvencAvailable = true;
+    LOG("NVENC API loaded");
+    return true;
+}
+
+static bool ensureSurfaceHostBuffer(NVSurface *surface)
+{
+    if (!surface) {
+        return false;
+    }
+    if (surface->hostData) {
+        return true;
+    }
+
+    uint32_t aw = ROUND_UP(surface->width, NVENC_PITCH_ALIGN);
+    uint32_t ah = ROUND_UP(surface->height, NVENC_HEIGHT_ALIGN);
+    size_t pitch = aw;
+    size_t ySize = pitch * ah;
+    size_t total = ySize + pitch * (ah / 2);
+    uint8_t *data = calloc(1, total);
+    if (!data) {
+        return false;
+    }
+
+    surface->hostData = data;
+    surface->hostPitch = pitch;
+    surface->hostYSize = ySize;
+    surface->hostTotalSize = total;
+    surface->status = VASurfaceReady;
+    return true;
+}
+
+static void nvencSetBitrate(NVContext *nvCtx, uint32_t bitsPerSecond)
+{
+    if (bitsPerSecond == 0) {
+        return;
+    }
+    NV_ENC_RC_PARAMS *rc = &nvCtx->encConfig.rcParams;
+    if (rc->rateControlMode == NV_ENC_PARAMS_RC_CBR) {
+        rc->averageBitRate = bitsPerSecond;
+        rc->maxBitRate = bitsPerSecond;
+    } else {
+        rc->averageBitRate = bitsPerSecond;
+        if (rc->maxBitRate < bitsPerSecond) {
+            rc->maxBitRate = bitsPerSecond;
+        }
+    }
+    nvCtx->encNeedsReconfigure = 1;
+}
+
+static void nvencSetFrameRate(NVContext *nvCtx, uint32_t fpsNum, uint32_t fpsDen)
+{
+    if (fpsNum == 0) {
+        return;
+    }
+    if (fpsDen == 0) {
+        fpsDen = 1;
+    }
+    nvCtx->encInitParams.frameRateNum = fpsNum;
+    nvCtx->encInitParams.frameRateDen = fpsDen;
+    nvCtx->encNeedsReconfigure = 1;
+}
+
+static void nvencSetGop(NVContext *nvCtx, uint32_t gopLength, uint32_t idrPeriod)
+{
+    if (gopLength > 0) {
+        nvCtx->encConfig.gopLength = gopLength;
+        nvCtx->encNeedsReconfigure = 1;
+    }
+    if (!nvCtx->encIsHevc) {
+        if (idrPeriod > 0) {
+            nvCtx->encConfig.encodeCodecConfig.h264Config.idrPeriod = idrPeriod;
+            nvCtx->encNeedsReconfigure = 1;
+        }
+    } else {
+        if (idrPeriod > 0) {
+            nvCtx->encConfig.encodeCodecConfig.hevcConfig.idrPeriod = idrPeriod;
+            nvCtx->encNeedsReconfigure = 1;
+        }
+    }
+}
+
+static void nvencSetVisibleRect(NVContext *nvCtx, uint32_t x, uint32_t y, uint32_t w, uint32_t h)
+{
+    if (w == 0 || h == 0) {
+        nvCtx->encVisibleValid = 0;
+        return;
+    }
+    x &= ~1U;
+    y &= ~1U;
+    w &= ~1U;
+    h &= ~1U;
+    if (w == 0 || h == 0) {
+        nvCtx->encVisibleValid = 0;
+        return;
+    }
+    if (x >= (uint32_t) nvCtx->width || y >= (uint32_t) nvCtx->height) {
+        nvCtx->encVisibleValid = 0;
+        return;
+    }
+    if (x + w > (uint32_t) nvCtx->width) {
+        w = (uint32_t) nvCtx->width - x;
+    }
+    if (y + h > (uint32_t) nvCtx->height) {
+        h = (uint32_t) nvCtx->height - y;
+    }
+    w &= ~1U;
+    h &= ~1U;
+    if (w == 0 || h == 0) {
+        nvCtx->encVisibleValid = 0;
+        return;
+    }
+    nvCtx->encVisibleX = x;
+    nvCtx->encVisibleY = y;
+    nvCtx->encVisibleWidth = w;
+    nvCtx->encVisibleHeight = h;
+    nvCtx->encVisibleValid = 1;
+}
+
+static void nvencMaybeUseVisibleResolution(NVContext *nvCtx)
+{
+    if (!nvCtx->encVisibleValid) {
+        return;
+    }
+    if (nvCtx->encVisibleWidth == 0 || nvCtx->encVisibleHeight == 0) {
+        return;
+    }
+    if (nvCtx->encVisibleX != 0 || nvCtx->encVisibleY != 0) {
+        return;
+    }
+
+    uint32_t visW = nvCtx->encVisibleWidth;
+    uint32_t visH = nvCtx->encVisibleHeight;
+    if (visW == nvCtx->width && visH == nvCtx->height) {
+        return;
+    }
+    if (visW > nvCtx->encInitParams.maxEncodeWidth || visH > nvCtx->encInitParams.maxEncodeHeight) {
+        return;
+    }
+
+    nvCtx->encInitParams.encodeWidth = visW;
+    nvCtx->encInitParams.encodeHeight = visH;
+    nvCtx->encInitParams.darWidth = visW;
+    nvCtx->encInitParams.darHeight = visH;
+    nvCtx->encNeedsReconfigure = 1;
+    LOG("NVENC visible reconfigure requested: %dx%d -> %ux%u",
+        nvCtx->width, nvCtx->height, visW, visH);
+}
+
+static void nvencUpdateVisibleRectFromH264Seq(NVContext *nvCtx, const VAEncSequenceParameterBufferH264 *seq)
+{
+    if (!seq) {
+        return;
+    }
+
+    uint32_t codedW = (uint32_t) seq->picture_width_in_mbs * 16U;
+    uint32_t codedH = (uint32_t) seq->picture_height_in_mbs * 16U;
+
+    uint32_t chroma = seq->seq_fields.bits.chroma_format_idc;
+    uint32_t frameMbsOnly = seq->seq_fields.bits.frame_mbs_only_flag ? 1U : 0U;
+    uint32_t cropUnitX = 1U;
+    uint32_t cropUnitY = frameMbsOnly ? 1U : 2U;
+
+    switch (chroma) {
+        case 0: /* monochrome */
+            cropUnitX = 1U;
+            cropUnitY = frameMbsOnly ? 1U : 2U;
+            break;
+        case 1: /* 4:2:0 */
+            cropUnitX = 2U;
+            cropUnitY = frameMbsOnly ? 2U : 4U;
+            break;
+        case 2: /* 4:2:2 */
+            cropUnitX = 2U;
+            cropUnitY = frameMbsOnly ? 1U : 2U;
+            break;
+        case 3: /* 4:4:4 */
+        default:
+            cropUnitX = 1U;
+            cropUnitY = frameMbsOnly ? 1U : 2U;
+            break;
+    }
+
+    uint32_t cropL = 0, cropR = 0, cropT = 0, cropB = 0;
+    if (seq->frame_cropping_flag) {
+        cropL = seq->frame_crop_left_offset * cropUnitX;
+        cropR = seq->frame_crop_right_offset * cropUnitX;
+        cropT = seq->frame_crop_top_offset * cropUnitY;
+        cropB = seq->frame_crop_bottom_offset * cropUnitY;
+    }
+
+    uint32_t visX = cropL;
+    uint32_t visY = cropT;
+    uint32_t visW = codedW;
+    uint32_t visH = codedH;
+    if (visW > cropL + cropR) {
+        visW -= (cropL + cropR);
+    }
+    if (visH > cropT + cropB) {
+        visH -= (cropT + cropB);
+    }
+
+    nvencSetVisibleRect(nvCtx, visX, visY, visW, visH);
+    if (nvCtx->encVisibleValid) {
+        nvencMaybeUseVisibleResolution(nvCtx);
+    }
+}
+
+static void nvencUpdateVisibleRectFromHevcSeq(NVContext *nvCtx, const VAEncSequenceParameterBufferHEVC *seq)
+{
+    if (!seq) {
+        return;
+    }
+    if (seq->pic_width_in_luma_samples == 0 || seq->pic_height_in_luma_samples == 0) {
+        return;
+    }
+    nvencSetVisibleRect(nvCtx, 0, 0, seq->pic_width_in_luma_samples, seq->pic_height_in_luma_samples);
+    if (nvCtx->encVisibleValid) {
+        nvencMaybeUseVisibleResolution(nvCtx);
+    }
+}
+
+static VAStatus nvencReconfigureIfNeeded(NVDriver *drv, NVContext *nvCtx)
+{
+    if (!nvCtx->encNeedsReconfigure) {
+        return VA_STATUS_SUCCESS;
+    }
+    if (!drv->nvencFuncs.nvEncReconfigureEncoder) {
+        return VA_STATUS_SUCCESS;
+    }
+
+    NV_ENC_RECONFIGURE_PARAMS reconfig;
+    memset(&reconfig, 0, sizeof(reconfig));
+    reconfig.version = NV_ENC_RECONFIGURE_PARAMS_VER;
+    reconfig.reInitEncodeParams = nvCtx->encInitParams;
+    reconfig.reInitEncodeParams.encodeConfig = &nvCtx->encConfig;
+
+    NVENCSTATUS nvs = drv->nvencFuncs.nvEncReconfigureEncoder(nvCtx->nvencEncoder, &reconfig);
+    if (nvs != NV_ENC_SUCCESS) {
+        LOG("nvEncReconfigureEncoder failed: %s", nvencStatusStr(nvs));
+        return nvencToVaStatus(nvs);
+    }
+    nvCtx->encInitParams = reconfig.reInitEncodeParams;
+    nvCtx->encInitParams.encodeConfig = &nvCtx->encConfig;
+    nvCtx->width = (int) nvCtx->encInitParams.encodeWidth;
+    nvCtx->height = (int) nvCtx->encInitParams.encodeHeight;
+    LOG("NVENC reconfigured: ctx now %dx%d", nvCtx->width, nvCtx->height);
+    nvCtx->encNeedsReconfigure = 0;
+    return VA_STATUS_SUCCESS;
+}
+
 static void* resolveSurfaces(void *param) {
     NVContext *ctx = (NVContext*) param;
     NVDriver *drv = ctx->drv;
@@ -434,6 +1000,8 @@ static void* resolveSurfaces(void *param) {
         //LOG("Mapping surface %d", surface->pictureIdx);
         if (surface->decodeFailed || CHECK_CUDA_RESULT(cv->cuvidMapVideoFrame(ctx->decoder, surface->pictureIdx, &deviceMemory, &pitch, &procParams))) {
             pthread_mutex_lock(&surface->mutex);
+            surface->decodeFailed = true;
+            surface->status = VASurfaceReady;
             surface->resolving = 0;
             pthread_cond_signal(&surface->cond);
             pthread_mutex_unlock(&surface->mutex);
@@ -442,11 +1010,20 @@ static void* resolveSurfaces(void *param) {
         //LOG("Mapped surface %d to %p (%d)", surface->pictureIdx, (void*)deviceMemory, pitch);
 
         //update cuarray
-        drv->backend->exportCudaPtr(drv, deviceMemory, surface, pitch);
+        bool exported = drv->backend->exportCudaPtr(drv, deviceMemory, surface, pitch);
         //LOG("Surface %d exported", surface->pictureIdx);
         //unmap frame
 
         CHECK_CUDA_RESULT(cv->cuvidUnmapVideoFrame(ctx->decoder, deviceMemory));
+
+        if (!exported) {
+            pthread_mutex_lock(&surface->mutex);
+            surface->decodeFailed = true;
+            surface->status = VASurfaceReady;
+            surface->resolving = 0;
+            pthread_cond_signal(&surface->cond);
+            pthread_mutex_unlock(&surface->mutex);
+        }
     }
 out:
     //release the decoder here to prevent multiple threads attempting it
@@ -604,8 +1181,16 @@ static VAStatus nvQueryConfigEntrypoints(
         int *num_entrypoints			/* out */
     )
 {
-    entrypoint_list[0] = VAEntrypointVLD;
-    *num_entrypoints = 1;
+    NVDriver *drv = (NVDriver*) ctx->pDriverData;
+    int n = 0;
+    if (vaToCuCodec(profile) != cudaVideoCodec_NONE) {
+        entrypoint_list[n++] = VAEntrypointVLD;
+    }
+    if (drv->nvencAvailable && isEncodeProfile(profile)) {
+        entrypoint_list[n++] = VAEntrypointEncSlice;
+        entrypoint_list[n++] = VAEntrypointEncSliceLP;
+    }
+    *num_entrypoints = n;
 
     return VA_STATUS_SUCCESS;
 }
@@ -619,6 +1204,38 @@ static VAStatus nvGetConfigAttributes(
     )
 {
     NVDriver *drv = (NVDriver*) ctx->pDriverData;
+    if ((entrypoint == VAEntrypointEncSlice || entrypoint == VAEntrypointEncSliceLP) && drv->nvencAvailable) {
+        if (!isEncodeProfile(profile)) {
+            return VA_STATUS_ERROR_UNSUPPORTED_PROFILE;
+        }
+        for (int i = 0; i < num_attribs; i++) {
+            switch (attrib_list[i].type) {
+                case VAConfigAttribRTFormat:
+                    attrib_list[i].value = VA_RT_FORMAT_YUV420;
+                    break;
+                case VAConfigAttribRateControl:
+                    attrib_list[i].value = VA_RC_CBR | VA_RC_VBR | VA_RC_CQP;
+                    break;
+                case VAConfigAttribEncMaxRefFrames:
+                    attrib_list[i].value = 4;
+                    break;
+                case VAConfigAttribMaxPictureWidth:
+                case VAConfigAttribMaxPictureHeight:
+                    attrib_list[i].value = 8192;
+                    break;
+                case VAConfigAttribEncPackedHeaders:
+                    attrib_list[i].value = VA_ENC_PACKED_HEADER_SEQUENCE |
+                                           VA_ENC_PACKED_HEADER_PICTURE |
+                                           VA_ENC_PACKED_HEADER_SLICE;
+                    break;
+                default:
+                    attrib_list[i].value = VA_ATTRIB_NOT_SUPPORTED;
+                    break;
+            }
+        }
+        return VA_STATUS_SUCCESS;
+    }
+
     if (vaToCuCodec(profile) == cudaVideoCodec_NONE) {
         return VA_STATUS_ERROR_UNSUPPORTED_PROFILE;
     }
@@ -691,6 +1308,38 @@ static VAStatus nvCreateConfig(
 {
     NVDriver *drv = (NVDriver*) ctx->pDriverData;
     //LOG("got profile: %d with %d attributes", profile, num_attribs);
+
+    if (entrypoint == VAEntrypointEncSlice || entrypoint == VAEntrypointEncSliceLP) {
+        if (!drv->nvencAvailable) {
+            return VA_STATUS_ERROR_UNSUPPORTED_ENTRYPOINT;
+        }
+        if (!isEncodeProfile(profile)) {
+            return VA_STATUS_ERROR_UNSUPPORTED_PROFILE;
+        }
+
+        Object obj = allocateObject(drv, OBJECT_TYPE_CONFIG, sizeof(NVConfig));
+        NVConfig *cfg = (NVConfig*) obj->obj;
+        cfg->profile = profile;
+        cfg->entrypoint = entrypoint;
+        cfg->isEncode = true;
+        cfg->encodeRCMode = VA_RC_CBR;
+        cfg->surfaceFormat = cudaVideoSurfaceFormat_NV12;
+        cfg->chromaFormat = cudaVideoChromaFormat_420;
+        cfg->bitDepth = (profile == VAProfileHEVCMain10) ? 10 : 8;
+        cfg->cudaCodec = (profile == VAProfileHEVCMain || profile == VAProfileHEVCMain10)
+                             ? cudaVideoCodec_HEVC
+                             : cudaVideoCodec_H264;
+
+        for (int i = 0; i < num_attribs; i++) {
+            if (attrib_list[i].type == VAConfigAttribRateControl) {
+                cfg->encodeRCMode = attrib_list[i].value;
+            }
+        }
+
+        *config_id = obj->id;
+        return VA_STATUS_SUCCESS;
+    }
+
     cudaVideoCodec cudaCodec = vaToCuCodec(profile);
 
     if (cudaCodec == cudaVideoCodec_NONE) {
@@ -708,6 +1357,7 @@ static VAStatus nvCreateConfig(
     NVConfig *cfg = (NVConfig*) obj->obj;
     cfg->profile = profile;
     cfg->entrypoint = entrypoint;
+    cfg->isEncode = false;
 
     //this will contain all the attributes the client cares about
     //for (int i = 0; i < num_attribs; i++) {
@@ -857,9 +1507,34 @@ static VAStatus nvQueryConfigAttributes(
     if (cfg == NULL) {
         return VA_STATUS_ERROR_INVALID_CONFIG;
     }
+    if (num_attribs == NULL) {
+        return VA_STATUS_ERROR_INVALID_PARAMETER;
+    }
+    if (profile) {
+        *profile = cfg->profile;
+    }
+    if (entrypoint) {
+        *entrypoint = cfg->entrypoint;
+    }
 
-    *profile = cfg->profile;
-    *entrypoint = cfg->entrypoint;
+    if (cfg->isEncode) {
+        if (!attrib_list) {
+            *num_attribs = 2;
+            return VA_STATUS_SUCCESS;
+        }
+        attrib_list[0].type = VAConfigAttribRTFormat;
+        attrib_list[0].value = VA_RT_FORMAT_YUV420;
+        attrib_list[1].type = VAConfigAttribRateControl;
+        attrib_list[1].value = cfg->encodeRCMode;
+        *num_attribs = 2;
+        return VA_STATUS_SUCCESS;
+    }
+
+    if (!attrib_list) {
+        *num_attribs = 1;
+        return VA_STATUS_SUCCESS;
+    }
+
     int i = 0;
     attrib_list[i].value = VA_RT_FORMAT_YUV420;
     attrib_list[i].type = VAConfigAttribRTFormat;
@@ -986,6 +1661,16 @@ static VAStatus nvCreateSurfaces2(
         suf->chromaFormat = chromaFormat;
         pthread_mutex_init(&suf->mutex, NULL);
         pthread_cond_init(&suf->cond, NULL);
+        if (!ensureSurfaceHostBuffer(suf)) {
+            CHECK_CUDA_RESULT_RETURN(cu->cuCtxPopCurrent(NULL), VA_STATUS_ERROR_OPERATION_FAILED);
+            return VA_STATUS_ERROR_ALLOCATION_FAILED;
+        }
+        suf->contentX = 0;
+        suf->contentY = 0;
+        suf->contentWidth = width;
+        suf->contentHeight = height;
+        suf->contentValid = 0;
+        suf->status = VASurfaceReady;
 
         LOG("Creating surface %ux%u, format %X (%p)", width, height, format, suf);
     }
@@ -1025,6 +1710,8 @@ static VAStatus nvDestroySurfaces(
         LOG("Destroying surface %d (%p)", surface->pictureIdx, surface);
 
         drv->backend->detachBackingImageFromSurface(drv, surface);
+        free(surface->hostData);
+        surface->hostData = NULL;
 
         deleteObject(drv, surface_list[i]);
     }
@@ -1048,6 +1735,176 @@ static VAStatus nvCreateContext(
 
     if (cfg == NULL) {
         return VA_STATUS_ERROR_INVALID_CONFIG;
+    }
+
+    if (cfg->isEncode) {
+        if (!drv->nvencAvailable) {
+            return VA_STATUS_ERROR_UNSUPPORTED_ENTRYPOINT;
+        }
+        if (picture_width <= 0 || picture_height <= 0) {
+            return VA_STATUS_ERROR_INVALID_PARAMETER;
+        }
+
+        Object contextObj = allocateObject(drv, OBJECT_TYPE_CONTEXT, sizeof(NVContext));
+        NVContext *nvCtx = (NVContext*) contextObj->obj;
+        nvCtx->drv = drv;
+        nvCtx->mode = NV_CONTEXT_ENCODE;
+        nvCtx->profile = cfg->profile;
+        nvCtx->entrypoint = cfg->entrypoint;
+        nvCtx->width = picture_width;
+        nvCtx->height = picture_height;
+        nvCtx->encPresetGuid = NV_ENC_PRESET_P4_GUID;
+        nvCtx->encFrameNum = 0;
+        nvCtx->encCurrentSurface = VA_INVALID_SURFACE;
+        nvCtx->encCodedBufId = VA_INVALID_ID;
+        nvCtx->encVisibleX = 0;
+        nvCtx->encVisibleY = 0;
+        nvCtx->encVisibleWidth = picture_width;
+        nvCtx->encVisibleHeight = picture_height;
+        nvCtx->encVisibleValid = 0;
+        nvCtx->encLastFrameData = NULL;
+        nvCtx->encLastFrameSize = 0;
+        nvCtx->encLastFrameValid = 0;
+
+        if (!profileToNvencGuids(cfg->profile, &nvCtx->encCodecGuid, &nvCtx->encProfileGuid, &nvCtx->encIsHevc)) {
+            deleteObject(drv, contextObj->id);
+            return VA_STATUS_ERROR_UNSUPPORTED_PROFILE;
+        }
+
+        CHECK_CUDA_RESULT_RETURN(cu->cuCtxPushCurrent(drv->cudaContext), VA_STATUS_ERROR_OPERATION_FAILED);
+
+        NV_ENC_OPEN_ENCODE_SESSION_EX_PARAMS openParams;
+        memset(&openParams, 0, sizeof(openParams));
+        openParams.version = NV_ENC_OPEN_ENCODE_SESSION_EX_PARAMS_VER;
+        openParams.deviceType = NV_ENC_DEVICE_TYPE_CUDA;
+        openParams.device = drv->cudaContext;
+        openParams.apiVersion = NVENCAPI_VERSION;
+
+        NVENCSTATUS nvs = drv->nvencFuncs.nvEncOpenEncodeSessionEx(&openParams, &nvCtx->nvencEncoder);
+        if (nvs != NV_ENC_SUCCESS) {
+            cu->cuCtxPopCurrent(NULL);
+            deleteObject(drv, contextObj->id);
+            LOG("nvEncOpenEncodeSessionEx failed: %s", nvencStatusStr(nvs));
+            return nvencToVaStatus(nvs);
+        }
+
+        NV_ENC_PRESET_CONFIG presetConfig;
+        memset(&presetConfig, 0, sizeof(presetConfig));
+        presetConfig.version = NV_ENC_PRESET_CONFIG_VER;
+        presetConfig.presetCfg.version = NV_ENC_CONFIG_VER;
+
+        nvs = drv->nvencFuncs.nvEncGetEncodePresetConfigEx(
+            nvCtx->nvencEncoder,
+            nvCtx->encCodecGuid,
+            nvCtx->encPresetGuid,
+            NV_ENC_TUNING_INFO_LOW_LATENCY,
+            &presetConfig);
+        if (nvs != NV_ENC_SUCCESS) {
+            drv->nvencFuncs.nvEncDestroyEncoder(nvCtx->nvencEncoder);
+            nvCtx->nvencEncoder = NULL;
+            cu->cuCtxPopCurrent(NULL);
+            deleteObject(drv, contextObj->id);
+            LOG("nvEncGetEncodePresetConfigEx failed: %s", nvencStatusStr(nvs));
+            return nvencToVaStatus(nvs);
+        }
+
+        nvCtx->encConfig = presetConfig.presetCfg;
+        nvCtx->encConfig.version = NV_ENC_CONFIG_VER;
+        nvCtx->encConfig.profileGUID = nvCtx->encProfileGuid;
+        nvCtx->encConfig.gopLength = 120;
+        nvCtx->encConfig.frameIntervalP = 1;
+        nvCtx->encConfig.rcParams.version = NV_ENC_RC_PARAMS_VER;
+
+        if (cfg->encodeRCMode & VA_RC_CBR) {
+            nvCtx->encConfig.rcParams.rateControlMode = NV_ENC_PARAMS_RC_CBR;
+            nvCtx->encConfig.rcParams.averageBitRate = 5000000;
+            nvCtx->encConfig.rcParams.maxBitRate = 5000000;
+        } else if (cfg->encodeRCMode & VA_RC_VBR) {
+            nvCtx->encConfig.rcParams.rateControlMode = NV_ENC_PARAMS_RC_VBR;
+            nvCtx->encConfig.rcParams.averageBitRate = 5000000;
+            nvCtx->encConfig.rcParams.maxBitRate = 10000000;
+        } else if (cfg->encodeRCMode & VA_RC_CQP) {
+            nvCtx->encConfig.rcParams.rateControlMode = NV_ENC_PARAMS_RC_CONSTQP;
+            nvCtx->encConfig.rcParams.constQP.qpInterP = 28;
+            nvCtx->encConfig.rcParams.constQP.qpInterB = 31;
+            nvCtx->encConfig.rcParams.constQP.qpIntra = 25;
+        } else {
+            nvCtx->encConfig.rcParams.rateControlMode = NV_ENC_PARAMS_RC_CBR;
+            nvCtx->encConfig.rcParams.averageBitRate = 5000000;
+            nvCtx->encConfig.rcParams.maxBitRate = 5000000;
+        }
+
+        if (!nvCtx->encIsHevc) {
+            nvCtx->encConfig.encodeCodecConfig.h264Config.idrPeriod = nvCtx->encConfig.gopLength;
+            nvCtx->encConfig.encodeCodecConfig.h264Config.repeatSPSPPS = 1;
+        } else {
+            nvCtx->encConfig.encodeCodecConfig.hevcConfig.idrPeriod = nvCtx->encConfig.gopLength;
+            nvCtx->encConfig.encodeCodecConfig.hevcConfig.repeatSPSPPS = 1;
+        }
+
+        memset(&nvCtx->encInitParams, 0, sizeof(nvCtx->encInitParams));
+        nvCtx->encInitParams.version = NV_ENC_INITIALIZE_PARAMS_VER;
+        nvCtx->encInitParams.encodeGUID = nvCtx->encCodecGuid;
+        nvCtx->encInitParams.presetGUID = nvCtx->encPresetGuid;
+        nvCtx->encInitParams.encodeWidth = picture_width;
+        nvCtx->encInitParams.encodeHeight = picture_height;
+        nvCtx->encInitParams.darWidth = picture_width;
+        nvCtx->encInitParams.darHeight = picture_height;
+        nvCtx->encInitParams.frameRateNum = 30;
+        nvCtx->encInitParams.frameRateDen = 1;
+        nvCtx->encInitParams.enablePTD = 1;
+        nvCtx->encInitParams.tuningInfo = NV_ENC_TUNING_INFO_LOW_LATENCY;
+        nvCtx->encInitParams.encodeConfig = &nvCtx->encConfig;
+        nvCtx->encInitParams.maxEncodeWidth = picture_width;
+        nvCtx->encInitParams.maxEncodeHeight = picture_height;
+
+        nvs = drv->nvencFuncs.nvEncInitializeEncoder(nvCtx->nvencEncoder, &nvCtx->encInitParams);
+        if (nvs != NV_ENC_SUCCESS) {
+            drv->nvencFuncs.nvEncDestroyEncoder(nvCtx->nvencEncoder);
+            nvCtx->nvencEncoder = NULL;
+            cu->cuCtxPopCurrent(NULL);
+            deleteObject(drv, contextObj->id);
+            LOG("nvEncInitializeEncoder failed: %s", nvencStatusStr(nvs));
+            return nvencToVaStatus(nvs);
+        }
+
+        NV_ENC_CREATE_INPUT_BUFFER createInput;
+        memset(&createInput, 0, sizeof(createInput));
+        createInput.version = NV_ENC_CREATE_INPUT_BUFFER_VER;
+        createInput.width = picture_width;
+        createInput.height = picture_height;
+        createInput.bufferFmt = NV_ENC_BUFFER_FORMAT_NV12;
+
+        nvs = drv->nvencFuncs.nvEncCreateInputBuffer(nvCtx->nvencEncoder, &createInput);
+        if (nvs != NV_ENC_SUCCESS) {
+            drv->nvencFuncs.nvEncDestroyEncoder(nvCtx->nvencEncoder);
+            nvCtx->nvencEncoder = NULL;
+            cu->cuCtxPopCurrent(NULL);
+            deleteObject(drv, contextObj->id);
+            LOG("nvEncCreateInputBuffer failed: %s", nvencStatusStr(nvs));
+            return nvencToVaStatus(nvs);
+        }
+        nvCtx->nvencInputBuffer = createInput.inputBuffer;
+
+        NV_ENC_CREATE_BITSTREAM_BUFFER createBS;
+        memset(&createBS, 0, sizeof(createBS));
+        createBS.version = NV_ENC_CREATE_BITSTREAM_BUFFER_VER;
+        nvs = drv->nvencFuncs.nvEncCreateBitstreamBuffer(nvCtx->nvencEncoder, &createBS);
+        if (nvs != NV_ENC_SUCCESS) {
+            drv->nvencFuncs.nvEncDestroyInputBuffer(nvCtx->nvencEncoder, nvCtx->nvencInputBuffer);
+            drv->nvencFuncs.nvEncDestroyEncoder(nvCtx->nvencEncoder);
+            nvCtx->nvencInputBuffer = NULL;
+            nvCtx->nvencEncoder = NULL;
+            cu->cuCtxPopCurrent(NULL);
+            deleteObject(drv, contextObj->id);
+            LOG("nvEncCreateBitstreamBuffer failed: %s", nvencStatusStr(nvs));
+            return nvencToVaStatus(nvs);
+        }
+        nvCtx->nvencOutputBuffer = createBS.bitstreamBuffer;
+
+        CHECK_CUDA_RESULT_RETURN(cu->cuCtxPopCurrent(NULL), VA_STATUS_ERROR_OPERATION_FAILED);
+        *context = contextObj->id;
+        return VA_STATUS_SUCCESS;
     }
 
     LOG("Creating context with %d render targets, at %dx%d", num_render_targets, picture_width, picture_height);
@@ -1137,6 +1994,7 @@ static VAStatus nvCreateContext(
 
     NVContext *nvCtx = (NVContext*) contextObj->obj;
     nvCtx->drv = drv;
+    nvCtx->mode = NV_CONTEXT_DECODE;
     nvCtx->decoder = decoder;
     nvCtx->profile = cfg->profile;
     nvCtx->entrypoint = cfg->entrypoint;
@@ -1203,15 +2061,16 @@ static VAStatus nvCreateBuffer(
     NVDriver *drv = (NVDriver*) ctx->pDriverData;
 
     NVContext *nvCtx = (NVContext*) getObjectPtr(drv, OBJECT_TYPE_CONTEXT, context);
-    if (nvCtx == NULL) {
+    if (context != 0 && nvCtx == NULL) {
         return VA_STATUS_ERROR_INVALID_CONTEXT;
     }
+    bool isEncode = (nvCtx != NULL && nvCtx->mode == NV_CONTEXT_ENCODE);
 
     //HACK: This is an awful hack to support VP8 videos when running within FFMPEG.
     //VA-API doesn't pass enough information for NVDEC to work with, but the information is there
     //just before the start of the buffer that was passed to us.
     size_t offset = 0;
-    if (nvCtx->profile == VAProfileVP8Version0_3 && type == VASliceDataBufferType) {
+    if (!isEncode && nvCtx != NULL && nvCtx->profile == VAProfileVP8Version0_3 && type == VASliceDataBufferType) {
         offset = ((uintptr_t) data) & 0xf;
         data = ((char *) data) - offset;
         size += (unsigned int)offset;
@@ -1225,11 +2084,34 @@ static VAStatus nvCreateBuffer(
     buf->bufferType = type;
     buf->elements = num_elements;
     buf->size = num_elements * size;
-    buf->ptr = memalign(16, buf->size);
     buf->offset = offset;
+    buf->ownsPtr = true;
+    buf->surfaceId = VA_INVALID_SURFACE;
+    buf->commitOnUnmap = 0;
+    buf->mappedSurfaceLock = 0;
+
+    if (isEncode && type == VAEncCodedBufferType) {
+        size_t codedCapacity = buf->size > NVENC_CODED_BUF_SIZE ? buf->size : NVENC_CODED_BUF_SIZE;
+        buf->codedData = calloc(1, sizeof(VACodedBufferSegment) + codedCapacity);
+        if (!buf->codedData) {
+            deleteObject(drv, bufferObject->id);
+            return VA_STATUS_ERROR_ALLOCATION_FAILED;
+        }
+        buf->codedCapacity = codedCapacity;
+        buf->codedSeg = (VACodedBufferSegment*) buf->codedData;
+        memset(buf->codedSeg, 0, sizeof(VACodedBufferSegment));
+        buf->codedSeg->buf = buf->codedData + sizeof(VACodedBufferSegment);
+        buf->codedSeg->size = 0;
+        buf->codedSeg->status = 0;
+        buf->codedSeg->next = NULL;
+        return VA_STATUS_SUCCESS;
+    }
+
+    buf->ptr = memalign(16, buf->size);
 
     if (buf->ptr == NULL) {
         LOG("Unable to allocate buffer of %zu bytes", buf->size);
+        deleteObject(drv, bufferObject->id);
         return VA_STATUS_ERROR_ALLOCATION_FAILED;
     }
 
@@ -1247,7 +2129,13 @@ static VAStatus nvBufferSetNumElements(
         unsigned int num_elements	/* in */
     )
 {
-    return VA_STATUS_ERROR_UNIMPLEMENTED;
+    NVDriver *drv = (NVDriver*) ctx->pDriverData;
+    NVBuffer *buf = (NVBuffer*) getObjectPtr(drv, OBJECT_TYPE_BUFFER, buf_id);
+    if (!buf) {
+        return VA_STATUS_ERROR_INVALID_BUFFER;
+    }
+    buf->elements = num_elements;
+    return VA_STATUS_SUCCESS;
 }
 
 static VAStatus nvMapBuffer(
@@ -1263,7 +2151,40 @@ static VAStatus nvMapBuffer(
         return VA_STATUS_ERROR_INVALID_BUFFER;
     }
 
-    *pbuf = buf->ptr;
+    if (buf->bufferType == VAImageBufferType && buf->surfaceId != VA_INVALID_SURFACE) {
+        NVSurface *surf = (NVSurface*) getObjectPtr(drv, OBJECT_TYPE_SURFACE, buf->surfaceId);
+        if (surf != NULL && ensureSurfaceHostBuffer(surf) && g_encStrictMode) {
+            size_t need = surf->hostTotalSize;
+            if (!buf->ownsPtr || buf->ptr == surf->hostData || buf->size != need || buf->ptr == NULL) {
+                uint8_t *shadow = realloc((buf->ownsPtr && buf->ptr != NULL) ? buf->ptr : NULL, need);
+                if (shadow == NULL) {
+                    return VA_STATUS_ERROR_ALLOCATION_FAILED;
+                }
+                buf->ptr = shadow;
+                buf->size = need;
+                buf->ownsPtr = true;
+            }
+            pthread_mutex_lock(&surf->mutex);
+            memcpy(buf->ptr, surf->hostData, need);
+            pthread_mutex_unlock(&surf->mutex);
+            *pbuf = buf->ptr;
+            return VA_STATUS_SUCCESS;
+        }
+    }
+
+    if (buf->codedSeg != NULL) {
+        *pbuf = buf->codedSeg;
+    } else {
+        *pbuf = buf->ptr;
+    }
+
+    if (buf->bufferType == VAImageBufferType && buf->surfaceId != VA_INVALID_SURFACE && !buf->mappedSurfaceLock) {
+        NVSurface *surf = (NVSurface*) getObjectPtr(drv, OBJECT_TYPE_SURFACE, buf->surfaceId);
+        if (surf != NULL) {
+            pthread_mutex_lock(&surf->mutex);
+            buf->mappedSurfaceLock = 1;
+        }
+    }
 
     return VA_STATUS_SUCCESS;
 }
@@ -1273,6 +2194,60 @@ static VAStatus nvUnmapBuffer(
         VABufferID buf_id	/* in */
     )
 {
+    NVDriver *drv = (NVDriver*) ctx->pDriverData;
+    NVBuffer *buf = (NVBuffer*) getObjectPtr(drv, OBJECT_TYPE_BUFFER, buf_id);
+    if (buf == NULL) {
+        return VA_STATUS_ERROR_INVALID_BUFFER;
+    }
+    if (buf->bufferType == VAImageBufferType && buf->surfaceId != VA_INVALID_SURFACE) {
+        NVSurface *surf = (NVSurface*) getObjectPtr(drv, OBJECT_TYPE_SURFACE, buf->surfaceId);
+        if (surf != NULL && ensureSurfaceHostBuffer(surf)) {
+            int strictCommitted = 0;
+            if (g_encStrictMode && buf->ptr != NULL && buf->ownsPtr) {
+                size_t copy = buf->size;
+                if (copy > surf->hostTotalSize) {
+                    copy = surf->hostTotalSize;
+                }
+                pthread_mutex_lock(&surf->mutex);
+                memcpy(surf->hostData, buf->ptr, copy);
+                strictCommitted = 1;
+            } else if (!buf->mappedSurfaceLock) {
+                pthread_mutex_lock(&surf->mutex);
+            }
+            surf->contentX = 0;
+            surf->contentY = 0;
+            surf->contentWidth = surf->width;
+            surf->contentHeight = surf->height;
+            surf->contentValid = 1;
+            surf->status = VASurfaceReady;
+            if (strictCommitted) {
+                pthread_mutex_unlock(&surf->mutex);
+            } else if (buf->mappedSurfaceLock) {
+                pthread_mutex_unlock(&surf->mutex);
+                buf->mappedSurfaceLock = 0;
+            } else {
+                pthread_mutex_unlock(&surf->mutex);
+            }
+        }
+    }
+    if (buf->commitOnUnmap && buf->surfaceId != VA_INVALID_SURFACE && buf->ptr != NULL) {
+        NVSurface *surf = (NVSurface*) getObjectPtr(drv, OBJECT_TYPE_SURFACE, buf->surfaceId);
+        if (surf != NULL && ensureSurfaceHostBuffer(surf)) {
+            size_t copy = buf->size;
+            if (copy > surf->hostTotalSize) {
+                copy = surf->hostTotalSize;
+            }
+            pthread_mutex_lock(&surf->mutex);
+            memcpy(surf->hostData, buf->ptr, copy);
+            surf->contentX = 0;
+            surf->contentY = 0;
+            surf->contentWidth = surf->width;
+            surf->contentHeight = surf->height;
+            surf->contentValid = 1;
+            surf->status = VASurfaceReady;
+            pthread_mutex_unlock(&surf->mutex);
+        }
+    }
     return VA_STATUS_SUCCESS;
 }
 
@@ -1288,8 +2263,18 @@ static VAStatus nvDestroyBuffer(
         return VA_STATUS_ERROR_INVALID_BUFFER;
     }
 
-    if (buf->ptr != NULL) {
+    if (buf->ptr != NULL && buf->ownsPtr) {
         free(buf->ptr);
+    }
+    if (buf->codedData != NULL) {
+        free(buf->codedData);
+    }
+    if (buf->mappedSurfaceLock && buf->surfaceId != VA_INVALID_SURFACE) {
+        NVSurface *surf = (NVSurface*) getObjectPtr(drv, OBJECT_TYPE_SURFACE, buf->surfaceId);
+        if (surf != NULL) {
+            pthread_mutex_unlock(&surf->mutex);
+        }
+        buf->mappedSurfaceLock = 0;
     }
 
     deleteObject(drv, buffer_id);
@@ -1315,6 +2300,24 @@ static VAStatus nvBeginPicture(
         return VA_STATUS_ERROR_INVALID_SURFACE;
     }
 
+    if (nvCtx->mode == NV_CONTEXT_ENCODE) {
+        if (!ensureSurfaceHostBuffer(surface)) {
+            return VA_STATUS_ERROR_ALLOCATION_FAILED;
+        }
+        nvCtx->encCurrentSurface = render_target;
+        nvCtx->encCodedBufId = VA_INVALID_ID;
+        nvCtx->encHasCodedBuf = 0;
+        nvCtx->encForceIdr = (nvCtx->encFrameNum == 0);
+        surface->context = nvCtx;
+        surface->contentX = 0;
+        surface->contentY = 0;
+        surface->contentWidth = surface->width;
+        surface->contentHeight = surface->height;
+        surface->contentValid = 0;
+        surface->status = VASurfaceRendering;
+        return VA_STATUS_SUCCESS;
+    }
+
     if (surface->context != NULL && surface->context != nvCtx) {
         //this surface was last used on a different context, we need to free up the backing image (it might not be the correct size)
         if (surface->backingImage != NULL) {
@@ -1336,6 +2339,7 @@ static VAStatus nvBeginPicture(
     //until after this function returns...
     pthread_mutex_lock(&surface->mutex);
     surface->resolving = 1;
+    surface->status = VASurfaceRendering;
     pthread_mutex_unlock(&surface->mutex);
 
     memset(&nvCtx->pPicParams, 0, sizeof(CUVIDPICPARAMS));
@@ -1358,6 +2362,115 @@ static VAStatus nvRenderPicture(
 
     if (nvCtx == NULL) {
         return VA_STATUS_ERROR_INVALID_CONTEXT;
+    }
+
+    if (nvCtx->mode == NV_CONTEXT_ENCODE) {
+        for (int i = 0; i < num_buffers; i++) {
+            NVBuffer *buf = (NVBuffer*) getObjectPtr(drv, OBJECT_TYPE_BUFFER, buffers[i]);
+            if (buf == NULL) {
+                continue;
+            }
+            switch (buf->bufferType) {
+                case VAEncCodedBufferType:
+                    nvCtx->encCodedBufId = buffers[i];
+                    nvCtx->encHasCodedBuf = 1;
+                    break;
+                case VAEncSequenceParameterBufferType:
+                    if (!nvCtx->encIsHevc && buf->ptr != NULL && buf->size >= sizeof(VAEncSequenceParameterBufferH264)) {
+                        const VAEncSequenceParameterBufferH264 *seq = (const VAEncSequenceParameterBufferH264 *) buf->ptr;
+                        nvencSetBitrate(nvCtx, seq->bits_per_second);
+                        nvencSetGop(nvCtx, seq->intra_period, seq->intra_idr_period);
+                        nvencUpdateVisibleRectFromH264Seq(nvCtx, seq);
+                        if (seq->vui_fields.bits.timing_info_present_flag && seq->time_scale != 0) {
+                            uint32_t den = seq->num_units_in_tick ? (seq->num_units_in_tick * 2U) : 1U;
+                            nvencSetFrameRate(nvCtx, seq->time_scale, den);
+                        }
+                    } else if (nvCtx->encIsHevc && buf->ptr != NULL && buf->size >= sizeof(VAEncSequenceParameterBufferHEVC)) {
+                        const VAEncSequenceParameterBufferHEVC *seq = (const VAEncSequenceParameterBufferHEVC *) buf->ptr;
+                        nvencSetBitrate(nvCtx, seq->bits_per_second);
+                        nvencSetGop(nvCtx, seq->intra_period, seq->intra_idr_period);
+                        nvencUpdateVisibleRectFromHevcSeq(nvCtx, seq);
+                        if (seq->vui_fields.bits.vui_timing_info_present_flag && seq->vui_time_scale != 0) {
+                            uint32_t den = seq->vui_num_units_in_tick ? seq->vui_num_units_in_tick : 1U;
+                            nvencSetFrameRate(nvCtx, seq->vui_time_scale, den);
+                        }
+                    }
+                    break;
+                case VAEncPictureParameterBufferType:
+                    if (!nvCtx->encIsHevc && buf->ptr != NULL && buf->size >= sizeof(VAEncPictureParameterBufferH264)) {
+                        const VAEncPictureParameterBufferH264 *pic = (const VAEncPictureParameterBufferH264 *) buf->ptr;
+                        if (pic->coded_buf != VA_INVALID_ID) {
+                            NVBuffer *codedBuf = (NVBuffer*) getObjectPtr(drv, OBJECT_TYPE_BUFFER, pic->coded_buf);
+                            if (codedBuf != NULL && codedBuf->bufferType == VAEncCodedBufferType) {
+                                nvCtx->encCodedBufId = pic->coded_buf;
+                                nvCtx->encHasCodedBuf = 1;
+                            }
+                        }
+                        if (pic->pic_fields.bits.idr_pic_flag) {
+                            nvCtx->encForceIdr = 1;
+                        }
+                    } else if (nvCtx->encIsHevc && buf->ptr != NULL && buf->size >= sizeof(VAEncPictureParameterBufferHEVC)) {
+                        const VAEncPictureParameterBufferHEVC *pic = (const VAEncPictureParameterBufferHEVC *) buf->ptr;
+                        if (pic->coded_buf != VA_INVALID_ID) {
+                            NVBuffer *codedBuf = (NVBuffer*) getObjectPtr(drv, OBJECT_TYPE_BUFFER, pic->coded_buf);
+                            if (codedBuf != NULL && codedBuf->bufferType == VAEncCodedBufferType) {
+                                nvCtx->encCodedBufId = pic->coded_buf;
+                                nvCtx->encHasCodedBuf = 1;
+                            }
+                        }
+                        if (pic->pic_fields.bits.idr_pic_flag) {
+                            nvCtx->encForceIdr = 1;
+                        }
+                    }
+                    break;
+                case VAEncMiscParameterBufferType:
+                    if (buf->ptr != NULL && buf->size >= sizeof(VAEncMiscParameterBuffer)) {
+                        const VAEncMiscParameterBuffer *misc = (const VAEncMiscParameterBuffer *) buf->ptr;
+                        const void *payload = misc->data;
+                        if (misc->type == VAEncMiscParameterTypeRateControl &&
+                            buf->size >= sizeof(VAEncMiscParameterBuffer) + sizeof(VAEncMiscParameterRateControl)) {
+                            const VAEncMiscParameterRateControl *rc = (const VAEncMiscParameterRateControl *) payload;
+                            if (rc->bits_per_second > 0) {
+                                if (rc->target_percentage && nvCtx->encConfig.rcParams.rateControlMode == NV_ENC_PARAMS_RC_VBR) {
+                                    uint64_t avg = ((uint64_t) rc->bits_per_second * (uint64_t) rc->target_percentage) / 100ULL;
+                                    if (avg > UINT32_MAX) {
+                                        avg = UINT32_MAX;
+                                    }
+                                    nvencSetBitrate(nvCtx, (uint32_t) avg);
+                                    nvCtx->encConfig.rcParams.maxBitRate = rc->bits_per_second;
+                                } else {
+                                    nvencSetBitrate(nvCtx, rc->bits_per_second);
+                                }
+                            }
+                            if (rc->max_qp > 0) {
+                                nvCtx->encConfig.rcParams.maxQP.qpInterB = rc->max_qp;
+                                nvCtx->encConfig.rcParams.maxQP.qpInterP = rc->max_qp;
+                                nvCtx->encConfig.rcParams.maxQP.qpIntra = rc->max_qp;
+                                nvCtx->encNeedsReconfigure = 1;
+                            }
+                            if (rc->min_qp > 0) {
+                                nvCtx->encConfig.rcParams.minQP.qpInterB = rc->min_qp;
+                                nvCtx->encConfig.rcParams.minQP.qpInterP = rc->min_qp;
+                                nvCtx->encConfig.rcParams.minQP.qpIntra = rc->min_qp;
+                                nvCtx->encNeedsReconfigure = 1;
+                            }
+                        } else if (misc->type == VAEncMiscParameterTypeFrameRate &&
+                                   buf->size >= sizeof(VAEncMiscParameterBuffer) + sizeof(VAEncMiscParameterFrameRate)) {
+                            const VAEncMiscParameterFrameRate *fr = (const VAEncMiscParameterFrameRate *) payload;
+                            uint32_t fpsNum = fr->framerate & 0xffff;
+                            uint32_t fpsDen = (fr->framerate >> 16) & 0xffff;
+                            if (fpsDen == 0) {
+                                fpsDen = 1;
+                            }
+                            nvencSetFrameRate(nvCtx, fpsNum, fpsDen);
+                        }
+                    }
+                    break;
+                default:
+                    break;
+            }
+        }
+        return VA_STATUS_SUCCESS;
     }
 
     CUVIDPICPARAMS *picParams = &nvCtx->pPicParams;
@@ -1387,7 +2500,320 @@ static VAStatus nvEndPicture(
     NVDriver *drv = (NVDriver*) ctx->pDriverData;
     NVContext *nvCtx = (NVContext*) getObjectPtr(drv, OBJECT_TYPE_CONTEXT, context);
 
-    if (nvCtx == NULL || nvCtx->decoder == NULL) {
+    if (nvCtx == NULL) {
+        return VA_STATUS_ERROR_INVALID_CONTEXT;
+    }
+
+    if (nvCtx->mode == NV_CONTEXT_ENCODE) {
+        if (nvCtx->encCurrentSurface == VA_INVALID_SURFACE) {
+            return VA_STATUS_ERROR_INVALID_SURFACE;
+        }
+        if (!nvCtx->encHasCodedBuf) {
+            return VA_STATUS_ERROR_INVALID_BUFFER;
+        }
+
+        NVSurface *surface = (NVSurface*) getObjectPtr(drv, OBJECT_TYPE_SURFACE, nvCtx->encCurrentSurface);
+        NVBuffer *codedBuf = (NVBuffer*) getObjectPtr(drv, OBJECT_TYPE_BUFFER, nvCtx->encCodedBufId);
+        if (!surface || !surface->hostData) {
+            return VA_STATUS_ERROR_INVALID_SURFACE;
+        }
+        if (!codedBuf || !codedBuf->codedSeg || codedBuf->codedCapacity == 0) {
+            return VA_STATUS_ERROR_INVALID_BUFFER;
+        }
+
+        VAStatus vas = nvencReconfigureIfNeeded(drv, nvCtx);
+        if (vas != VA_STATUS_SUCCESS) {
+            surface->status = VASurfaceReady;
+            return vas;
+        }
+
+        CHECK_CUDA_RESULT_RETURN(cu->cuCtxPushCurrent(drv->cudaContext), VA_STATUS_ERROR_OPERATION_FAILED);
+
+        NV_ENC_LOCK_INPUT_BUFFER lockInput;
+        memset(&lockInput, 0, sizeof(lockInput));
+        lockInput.version = NV_ENC_LOCK_INPUT_BUFFER_VER;
+        lockInput.inputBuffer = nvCtx->nvencInputBuffer;
+
+        NVENCSTATUS nvs = drv->nvencFuncs.nvEncLockInputBuffer(nvCtx->nvencEncoder, &lockInput);
+        if (nvs != NV_ENC_SUCCESS) {
+            cu->cuCtxPopCurrent(NULL);
+            surface->status = VASurfaceReady;
+            LOG("nvEncLockInputBuffer failed: %s", nvencStatusStr(nvs));
+            return nvencToVaStatus(nvs);
+        }
+
+        uint8_t *dst = (uint8_t *) lockInput.bufferDataPtr;
+        const uint8_t *src = surface->hostData;
+        const size_t srcPitch = surface->hostPitch;
+        const size_t dstPitch = lockInput.pitch;
+        uint32_t encWidth = (uint32_t) nvCtx->width;
+        uint32_t encHeight = (uint32_t) nvCtx->height;
+        uint32_t srcX = 0;
+        uint32_t srcY = 0;
+        uint32_t copyWidth = surface->width < encWidth ? surface->width : encWidth;
+        uint32_t copyHeight = surface->height < encHeight ? surface->height : encHeight;
+        uint64_t encDbgPreFullHash = 0;
+        uint64_t encDbgPreTopHash = 0;
+        uint32_t encDbgFrame = 0;
+        int encDbgEnabled = 0;
+        int encDbgDump = 0;
+
+        nvencDebugInitOnce();
+        if (g_encDebugEnabled) {
+            pthread_mutex_lock(&g_encDebugMutex);
+            encDbgFrame = g_encDebugFrameIndex++;
+            encDbgEnabled = 1;
+            if (encDbgFrame >= g_encDebugStartFrame) {
+                uint32_t rel = encDbgFrame - g_encDebugStartFrame;
+                encDbgDump = (rel < g_encDebugMaxFrames);
+            } else {
+                encDbgDump = 0;
+            }
+            pthread_mutex_unlock(&g_encDebugMutex);
+        }
+
+        if (nvCtx->encVisibleValid && nvCtx->encVisibleWidth > 0 && nvCtx->encVisibleHeight > 0) {
+            srcX = nvCtx->encVisibleX;
+            srcY = nvCtx->encVisibleY;
+            copyWidth = nvCtx->encVisibleWidth < encWidth ? nvCtx->encVisibleWidth : encWidth;
+            copyHeight = nvCtx->encVisibleHeight < encHeight ? nvCtx->encVisibleHeight : encHeight;
+        } else if (surface->contentValid && surface->contentWidth > 0 && surface->contentHeight > 0) {
+            srcX = surface->contentX;
+            srcY = surface->contentY;
+            copyWidth = surface->contentWidth < encWidth ? surface->contentWidth : encWidth;
+            copyHeight = surface->contentHeight < encHeight ? surface->contentHeight : encHeight;
+            if (srcX >= surface->width || srcY >= surface->height) {
+                srcX = 0;
+                srcY = 0;
+                copyWidth = surface->width < encWidth ? surface->width : encWidth;
+                copyHeight = surface->height < encHeight ? surface->height : encHeight;
+            } else {
+                if (srcX + copyWidth > surface->width) {
+                    copyWidth = surface->width - srcX;
+                }
+                if (srcY + copyHeight > surface->height) {
+                    copyHeight = surface->height - srcY;
+                }
+            }
+        }
+
+        srcX &= ~1U;
+        srcY &= ~1U;
+        copyWidth &= ~1U;
+        copyHeight &= ~1U;
+        if (copyWidth == 0 || copyHeight == 0) {
+            copyWidth = encWidth & ~1U;
+            copyHeight = encHeight & ~1U;
+            srcX = 0;
+            srcY = 0;
+        }
+
+        /* Clear full destination frame first so padded regions are deterministic. */
+        for (uint32_t y = 0; y < encHeight; y++) {
+            memset(dst + ((size_t) y * dstPitch), 0x00, encWidth);
+        }
+        uint8_t *dstUV = dst + ((size_t) encHeight * dstPitch);
+        for (uint32_t y = 0; y < (encHeight / 2U); y++) {
+            memset(dstUV + ((size_t) y * dstPitch), 0x80, encWidth);
+        }
+
+        pthread_mutex_lock(&surface->mutex);
+        const uint8_t *srcYBase = src + ((size_t) srcY * srcPitch) + (size_t) srcX;
+        for (uint32_t y = 0; y < copyHeight; y++) {
+            memcpy(dst + ((size_t) y * dstPitch),
+                   srcYBase + ((size_t) y * srcPitch),
+                   copyWidth);
+        }
+        const uint8_t *srcUV = src + surface->hostYSize +
+                               ((size_t) (srcY / 2U) * srcPitch) + (size_t) srcX;
+        for (uint32_t y = 0; y < (copyHeight / 2U); y++) {
+            memcpy(dstUV + ((size_t) y * dstPitch), srcUV + ((size_t) y * srcPitch), copyWidth);
+        }
+        pthread_mutex_unlock(&surface->mutex);
+
+        if (encDbgEnabled) {
+            uint64_t h = 1469598103934665603ULL;
+            uint32_t topRows = copyHeight < 32U ? copyHeight : 32U;
+            uint32_t topRowsUV = topRows / 2U;
+
+            for (uint32_t row = 0; row < copyHeight; row++) {
+                h = fnv1a64_append(h, dst + ((size_t) row * dstPitch), copyWidth);
+            }
+            for (uint32_t row = 0; row < (copyHeight / 2U); row++) {
+                h = fnv1a64_append(h, dstUV + ((size_t) row * dstPitch), copyWidth);
+            }
+            encDbgPreFullHash = h;
+
+            h = 1469598103934665603ULL;
+            for (uint32_t row = 0; row < topRows; row++) {
+                h = fnv1a64_append(h, dst + ((size_t) row * dstPitch), copyWidth);
+            }
+            for (uint32_t row = 0; row < topRowsUV; row++) {
+                h = fnv1a64_append(h, dstUV + ((size_t) row * dstPitch), copyWidth);
+            }
+            encDbgPreTopHash = h;
+
+            LOG("ENCDBG pre frame=%u hash_full=%016llx hash_top32=%016llx copy=%ux%u enc=%ux%u src=(%u,%u) pitch=%zu",
+                encDbgFrame,
+                (unsigned long long) encDbgPreFullHash,
+                (unsigned long long) encDbgPreTopHash,
+                copyWidth, copyHeight, encWidth, encHeight, srcX, srcY, dstPitch);
+
+            if (encDbgDump) {
+                char leaf[128];
+                char path[PATH_MAX];
+                snprintf(leaf, sizeof(leaf), "frame_%06u_pre_nv12_%ux%u.yuv",
+                         encDbgFrame, copyWidth, copyHeight);
+                if (nvencDebugBuildPath(path, sizeof(path), leaf)) {
+                    nvencDebugDumpNV12(path, dst, dstUV, dstPitch, copyWidth, copyHeight);
+                }
+            }
+        }
+
+        nvs = drv->nvencFuncs.nvEncUnlockInputBuffer(nvCtx->nvencEncoder, nvCtx->nvencInputBuffer);
+        if (nvs != NV_ENC_SUCCESS) {
+            cu->cuCtxPopCurrent(NULL);
+            surface->status = VASurfaceReady;
+            LOG("nvEncUnlockInputBuffer failed: %s", nvencStatusStr(nvs));
+            return nvencToVaStatus(nvs);
+        }
+
+        NV_ENC_PIC_PARAMS picParams;
+        memset(&picParams, 0, sizeof(picParams));
+        picParams.version = NV_ENC_PIC_PARAMS_VER;
+        picParams.inputBuffer = nvCtx->nvencInputBuffer;
+        picParams.bufferFmt = NV_ENC_BUFFER_FORMAT_NV12;
+        picParams.inputPitch = (uint32_t) dstPitch;
+        picParams.inputWidth = copyWidth;
+        picParams.inputHeight = copyHeight;
+        picParams.outputBitstream = nvCtx->nvencOutputBuffer;
+        picParams.pictureStruct = NV_ENC_PIC_STRUCT_FRAME;
+        picParams.inputTimeStamp = nvCtx->encFrameNum;
+
+        if (g_encForceIdrEvery > 0 && (nvCtx->encFrameNum % g_encForceIdrEvery) == 0) {
+            nvCtx->encForceIdr = 1;
+        }
+        if (nvCtx->encForceIdr || nvCtx->encFrameNum == 0) {
+            picParams.encodePicFlags = NV_ENC_PIC_FLAG_FORCEIDR | NV_ENC_PIC_FLAG_OUTPUT_SPSPPS;
+            picParams.pictureType = NV_ENC_PIC_TYPE_IDR;
+        }
+
+        nvs = drv->nvencFuncs.nvEncEncodePicture(nvCtx->nvencEncoder, &picParams);
+        if (nvs == NV_ENC_ERR_INVALID_PARAM &&
+            (picParams.inputWidth != (uint32_t) nvCtx->width || picParams.inputHeight != (uint32_t) nvCtx->height)) {
+            LOG("nvEncEncodePicture rejected dynamic input size %ux%u (ctx %dx%d), trying reconfigure",
+                picParams.inputWidth, picParams.inputHeight, nvCtx->width, nvCtx->height);
+
+            int reconfigured = 0;
+            if (drv->nvencFuncs.nvEncReconfigureEncoder) {
+                NV_ENC_RECONFIGURE_PARAMS reconfig;
+                memset(&reconfig, 0, sizeof(reconfig));
+                reconfig.version = NV_ENC_RECONFIGURE_PARAMS_VER;
+                reconfig.reInitEncodeParams = nvCtx->encInitParams;
+                reconfig.reInitEncodeParams.encodeConfig = &nvCtx->encConfig;
+                reconfig.reInitEncodeParams.encodeWidth = copyWidth;
+                reconfig.reInitEncodeParams.encodeHeight = copyHeight;
+                reconfig.reInitEncodeParams.darWidth = copyWidth;
+                reconfig.reInitEncodeParams.darHeight = copyHeight;
+                if (reconfig.reInitEncodeParams.maxEncodeWidth < copyWidth) {
+                    reconfig.reInitEncodeParams.maxEncodeWidth = copyWidth;
+                }
+                if (reconfig.reInitEncodeParams.maxEncodeHeight < copyHeight) {
+                    reconfig.reInitEncodeParams.maxEncodeHeight = copyHeight;
+                }
+
+                NVENCSTATUS rnvs = drv->nvencFuncs.nvEncReconfigureEncoder(nvCtx->nvencEncoder, &reconfig);
+                if (rnvs == NV_ENC_SUCCESS) {
+                    nvCtx->encInitParams = reconfig.reInitEncodeParams;
+                    nvCtx->encInitParams.encodeConfig = &nvCtx->encConfig;
+                    nvCtx->width = (int) copyWidth;
+                    nvCtx->height = (int) copyHeight;
+                    reconfigured = 1;
+                    LOG("NVENC resolution reconfigured to %ux%u", copyWidth, copyHeight);
+                } else {
+                    LOG("nvEncReconfigureEncoder resolution change failed: %s", nvencStatusStr(rnvs));
+                }
+            }
+
+            if (reconfigured) {
+                nvs = drv->nvencFuncs.nvEncEncodePicture(nvCtx->nvencEncoder, &picParams);
+            }
+            if (nvs == NV_ENC_ERR_INVALID_PARAM) {
+                picParams.inputWidth = (uint32_t) nvCtx->width;
+                picParams.inputHeight = (uint32_t) nvCtx->height;
+                LOG("Falling back to context encode size %ux%u", picParams.inputWidth, picParams.inputHeight);
+                nvs = drv->nvencFuncs.nvEncEncodePicture(nvCtx->nvencEncoder, &picParams);
+            }
+        }
+        if (nvs != NV_ENC_SUCCESS && nvs != NV_ENC_ERR_NEED_MORE_INPUT) {
+            cu->cuCtxPopCurrent(NULL);
+            surface->status = VASurfaceReady;
+            LOG("nvEncEncodePicture failed: %s", nvencStatusStr(nvs));
+            return nvencToVaStatus(nvs);
+        }
+
+        NV_ENC_LOCK_BITSTREAM lockBS;
+        memset(&lockBS, 0, sizeof(lockBS));
+        lockBS.version = NV_ENC_LOCK_BITSTREAM_VER;
+        lockBS.outputBitstream = nvCtx->nvencOutputBuffer;
+
+        nvs = drv->nvencFuncs.nvEncLockBitstream(nvCtx->nvencEncoder, &lockBS);
+        if (nvs != NV_ENC_SUCCESS) {
+            cu->cuCtxPopCurrent(NULL);
+            surface->status = VASurfaceReady;
+            LOG("nvEncLockBitstream failed: %s", nvencStatusStr(nvs));
+            return nvencToVaStatus(nvs);
+        }
+
+        size_t copySize = lockBS.bitstreamSizeInBytes;
+        if (copySize > codedBuf->codedCapacity) {
+            codedBuf->codedSeg->status = VA_CODED_BUF_STATUS_SLICE_OVERFLOW_MASK;
+            copySize = codedBuf->codedCapacity;
+        } else {
+            codedBuf->codedSeg->status = 0;
+        }
+        memcpy(codedBuf->codedSeg->buf, lockBS.bitstreamBufferPtr, copySize);
+        codedBuf->codedSeg->size = copySize;
+        codedBuf->codedSeg->next = NULL;
+
+        if (encDbgEnabled) {
+            uint64_t bitstreamHash = 1469598103934665603ULL;
+            if (lockBS.bitstreamBufferPtr != NULL && lockBS.bitstreamSizeInBytes > 0) {
+                bitstreamHash = fnv1a64_append(bitstreamHash,
+                                               (const uint8_t *) lockBS.bitstreamBufferPtr,
+                                               (size_t) lockBS.bitstreamSizeInBytes);
+            }
+            LOG("ENCDBG bitstream frame=%u size=%u hash=%016llx pre_full=%016llx pre_top32=%016llx flags=0x%x",
+                encDbgFrame, lockBS.bitstreamSizeInBytes,
+                (unsigned long long) bitstreamHash,
+                (unsigned long long) encDbgPreFullHash,
+                (unsigned long long) encDbgPreTopHash,
+                picParams.encodePicFlags);
+
+            if (encDbgDump) {
+                char leaf[128];
+                char path[PATH_MAX];
+                const char *ext = nvCtx->encIsHevc ? "h265" : "h264";
+                snprintf(leaf, sizeof(leaf), "frame_%06u_bitstream.%s", encDbgFrame, ext);
+                if (nvencDebugBuildPath(path, sizeof(path), leaf)) {
+                    nvencDebugDumpBytes(path,
+                                        (const uint8_t *) lockBS.bitstreamBufferPtr,
+                                        (size_t) lockBS.bitstreamSizeInBytes);
+                }
+            }
+        }
+
+        drv->nvencFuncs.nvEncUnlockBitstream(nvCtx->nvencEncoder, nvCtx->nvencOutputBuffer);
+
+        CHECK_CUDA_RESULT_RETURN(cu->cuCtxPopCurrent(NULL), VA_STATUS_ERROR_OPERATION_FAILED);
+
+        nvCtx->encFrameNum++;
+        nvCtx->encForceIdr = 0;
+        surface->status = VASurfaceReady;
+        return VA_STATUS_SUCCESS;
+    }
+
+    if (nvCtx->decoder == NULL) {
         return VA_STATUS_ERROR_INVALID_CONTEXT;
     }
 
@@ -1416,6 +2842,7 @@ static VAStatus nvEndPicture(
     surface->topFieldFirst = !picParams->bottom_field_flag;
     surface->secondField = picParams->second_field;
     surface->decodeFailed = status != VA_STATUS_SUCCESS;
+    surface->status = VASurfaceRendering;
 
     //TODO check we're not overflowing the queue
     pthread_mutex_lock(&nvCtx->resolveMutex);
@@ -1447,7 +2874,7 @@ static VAStatus nvSyncSurface(
 
     //wait for resolve to occur before synchronising
     pthread_mutex_lock(&surface->mutex);
-    if (surface->resolving) {
+    while (surface->resolving) {
         //LOG("Surface %d not resolved, waiting", surface->pictureIdx);
         pthread_cond_wait(&surface->cond, &surface->mutex);
     }
@@ -1464,7 +2891,15 @@ static VAStatus nvQuerySurfaceStatus(
         VASurfaceStatus *status	/* out */
     )
 {
-    return VA_STATUS_ERROR_UNIMPLEMENTED;
+    NVDriver *drv = (NVDriver*) ctx->pDriverData;
+    NVSurface *surface = getObjectPtr(drv, OBJECT_TYPE_SURFACE, render_target);
+    if (!surface) {
+        return VA_STATUS_ERROR_INVALID_SURFACE;
+    }
+    if (status) {
+        *status = surface->status;
+    }
+    return VA_STATUS_SUCCESS;
 }
 
 static VAStatus nvQuerySurfaceError(
@@ -1561,6 +2996,7 @@ static VAStatus nvCreateImage(
     }
     imageBuffer->elements = 1;
     imageBuffer->ptr = memalign(16, imageBuffer->size);
+    imageBuffer->ownsPtr = true;
 
     img->imageBuffer = imageBuffer;
 
@@ -1592,6 +3028,10 @@ static VAStatus nvCreateImage(
     image->offsets[1] = image->offsets[0] + ((width * height) >> (p[0].ss.x + p[0].ss.y)) * fmtInfo->bppc * p[0].channelCount;
     image->offsets[2] = image->offsets[1] + ((width * height) >> (p[1].ss.x + p[1].ss.y)) * fmtInfo->bppc * p[1].channelCount;
 
+    img->numPlanes = image->num_planes;
+    memcpy(img->pitches, image->pitches, sizeof(img->pitches));
+    memcpy(img->offsets, image->offsets, sizeof(img->offsets));
+
     return VA_STATUS_SUCCESS;
 }
 
@@ -1601,9 +3041,51 @@ static VAStatus nvDeriveImage(
         VAImage *image     /* out */
     )
 {
-    //LOG("In %s", __func__);
-    //FAILED because we don't support it
-    return VA_STATUS_ERROR_OPERATION_FAILED;
+    NVDriver *drv = (NVDriver*) ctx->pDriverData;
+    NVSurface *surfaceObj = (NVSurface*) getObjectPtr(drv, OBJECT_TYPE_SURFACE, surface);
+    if (surfaceObj == NULL) {
+        return VA_STATUS_ERROR_INVALID_SURFACE;
+    }
+    if (!ensureSurfaceHostBuffer(surfaceObj)) {
+        return VA_STATUS_ERROR_ALLOCATION_FAILED;
+    }
+
+    Object imageBufferObject = allocateObject(drv, OBJECT_TYPE_BUFFER, sizeof(NVBuffer));
+    NVBuffer *imageBuffer = (NVBuffer*) imageBufferObject->obj;
+    imageBuffer->bufferType = VAImageBufferType;
+    imageBuffer->elements = 1;
+    imageBuffer->size = surfaceObj->hostTotalSize;
+    imageBuffer->ptr = surfaceObj->hostData;
+    imageBuffer->ownsPtr = false;
+    imageBuffer->surfaceId = surface;
+    imageBuffer->commitOnUnmap = 0;
+
+    Object imageObj = allocateObject(drv, OBJECT_TYPE_IMAGE, sizeof(NVImage));
+    NVImage *img = (NVImage*) imageObj->obj;
+    img->width = surfaceObj->width;
+    img->height = surfaceObj->height;
+    img->format = NV_FORMAT_NV12;
+    img->imageBuffer = imageBuffer;
+
+    memset(image, 0, sizeof(*image));
+    image->image_id = imageObj->id;
+    image->buf = imageBufferObject->id;
+    image->format = formatsInfo[NV_FORMAT_NV12].vaFormat;
+    image->width = surfaceObj->width;
+    image->height = surfaceObj->height;
+    image->data_size = surfaceObj->hostTotalSize;
+    image->num_planes = 2;
+    image->pitches[0] = surfaceObj->hostPitch;
+    image->pitches[1] = surfaceObj->hostPitch;
+    image->offsets[0] = 0;
+    image->offsets[1] = surfaceObj->hostYSize;
+    image->offsets[2] = 0;
+
+    img->numPlanes = image->num_planes;
+    memcpy(img->pitches, image->pitches, sizeof(img->pitches));
+    memcpy(img->offsets, image->offsets, sizeof(img->offsets));
+
+    return VA_STATUS_SUCCESS;
 }
 
 static VAStatus nvDestroyImage(
@@ -1621,7 +3103,7 @@ static VAStatus nvDestroyImage(
     Object imageBufferObj = getObjectByPtr(drv, OBJECT_TYPE_BUFFER, img->imageBuffer);
 
     if (imageBufferObj != NULL) {
-        if (img->imageBuffer->ptr != NULL) {
+        if (img->imageBuffer->ptr != NULL && img->imageBuffer->ownsPtr) {
             free(img->imageBuffer->ptr);
         }
 
@@ -1675,8 +3157,58 @@ static VAStatus nvGetImage(
     const NVFormatInfo *fmtInfo = &formatsInfo[imageObj->format];
     uint32_t offset = 0;
 
-    if (context == NULL) {
-        return VA_STATUS_ERROR_INVALID_CONTEXT;
+    if (context == NULL || context->mode == NV_CONTEXT_ENCODE) {
+        if (!surfaceObj->hostData || !imageObj->imageBuffer || !imageObj->imageBuffer->ptr) {
+            return VA_STATUS_ERROR_INVALID_CONTEXT;
+        }
+        if (x < 0 || y < 0) {
+            return VA_STATUS_ERROR_INVALID_PARAMETER;
+        }
+        if ((uint32_t) x >= surfaceObj->width || (uint32_t) y >= surfaceObj->height) {
+            return VA_STATUS_ERROR_INVALID_PARAMETER;
+        }
+
+        uint8_t *dst = (uint8_t *) imageObj->imageBuffer->ptr;
+        uint32_t dstPitchY = imageObj->pitches[0] ? imageObj->pitches[0] : imageObj->width;
+        uint32_t dstPitchUV = imageObj->pitches[1] ? imageObj->pitches[1] : dstPitchY;
+        uint32_t dstOffsetY = imageObj->offsets[0];
+        uint32_t dstOffsetUV = imageObj->offsets[1];
+
+        uint32_t copyW = width;
+        uint32_t copyH = height;
+        if ((uint32_t) x + copyW > surfaceObj->width) {
+            copyW = surfaceObj->width - (uint32_t) x;
+        }
+        if ((uint32_t) y + copyH > surfaceObj->height) {
+            copyH = surfaceObj->height - (uint32_t) y;
+        }
+        if (copyW > imageObj->width) {
+            copyW = imageObj->width;
+        }
+        if (copyH > imageObj->height) {
+            copyH = imageObj->height;
+        }
+
+        pthread_mutex_lock(&surfaceObj->mutex);
+        const uint8_t *srcY = surfaceObj->hostData + ((size_t) y * surfaceObj->hostPitch) + (size_t) x;
+        const uint8_t *srcUV = surfaceObj->hostData + surfaceObj->hostYSize +
+                               ((size_t) (y / 2) * surfaceObj->hostPitch) + (size_t) (x & ~1);
+
+        for (uint32_t row = 0; row < copyH; row++) {
+            memcpy(dst + dstOffsetY + ((size_t) row * dstPitchY),
+                   srcY + ((size_t) row * surfaceObj->hostPitch),
+                   copyW);
+        }
+
+        uint32_t uvWidth = copyW & ~1U;
+        uint32_t uvHeight = copyH / 2U;
+        for (uint32_t row = 0; row < uvHeight; row++) {
+            memcpy(dst + dstOffsetUV + ((size_t) row * dstPitchUV),
+                   srcUV + ((size_t) row * surfaceObj->hostPitch),
+                   uvWidth);
+        }
+        pthread_mutex_unlock(&surfaceObj->mutex);
+        return VA_STATUS_SUCCESS;
     }
 
     //wait for the surface to be decoded
@@ -1725,7 +3257,117 @@ static VAStatus nvPutImage(
         unsigned int dest_height
     )
 {
-    LOG("In %s", __func__);
+    NVDriver *drv = (NVDriver*) ctx->pDriverData;
+    NVSurface *surfaceObj = (NVSurface*) getObjectPtr(drv, OBJECT_TYPE_SURFACE, surface);
+    NVImage *imageObj = (NVImage*) getObjectPtr(drv, OBJECT_TYPE_IMAGE, image);
+    if (!surfaceObj) {
+        return VA_STATUS_ERROR_INVALID_SURFACE;
+    }
+    if (!imageObj || !imageObj->imageBuffer || !imageObj->imageBuffer->ptr) {
+        return VA_STATUS_ERROR_INVALID_IMAGE;
+    }
+    if (!ensureSurfaceHostBuffer(surfaceObj)) {
+        return VA_STATUS_ERROR_ALLOCATION_FAILED;
+    }
+
+    if (src_width == 0 || src_height == 0 || dest_width == 0 || dest_height == 0) {
+        surfaceObj->status = VASurfaceReady;
+        return VA_STATUS_SUCCESS;
+    }
+    if (src_x < 0 || src_y < 0 || dest_x < 0 || dest_y < 0) {
+        return VA_STATUS_ERROR_INVALID_PARAMETER;
+    }
+    if ((uint32_t) src_x >= imageObj->width || (uint32_t) src_y >= imageObj->height) {
+        return VA_STATUS_ERROR_INVALID_PARAMETER;
+    }
+    if ((uint32_t) dest_x >= surfaceObj->width || (uint32_t) dest_y >= surfaceObj->height) {
+        return VA_STATUS_ERROR_INVALID_PARAMETER;
+    }
+
+    uint8_t *srcBase = (uint8_t *) imageObj->imageBuffer->ptr;
+    uint32_t srcPitchY = imageObj->pitches[0] ? imageObj->pitches[0] : imageObj->width;
+    uint32_t srcPitchUV = imageObj->pitches[1] ? imageObj->pitches[1] : srcPitchY;
+    uint32_t srcOffsetY = imageObj->offsets[0];
+    uint32_t srcOffsetUV = imageObj->offsets[1];
+
+    uint32_t copyW = src_width < dest_width ? src_width : dest_width;
+    uint32_t copyH = src_height < dest_height ? src_height : dest_height;
+
+    if ((uint32_t) src_x + copyW > imageObj->width) {
+        copyW = imageObj->width - (uint32_t) src_x;
+    }
+    if ((uint32_t) src_y + copyH > imageObj->height) {
+        copyH = imageObj->height - (uint32_t) src_y;
+    }
+    if ((uint32_t) dest_x + copyW > surfaceObj->width) {
+        copyW = surfaceObj->width - (uint32_t) dest_x;
+    }
+    if ((uint32_t) dest_y + copyH > surfaceObj->height) {
+        copyH = surfaceObj->height - (uint32_t) dest_y;
+    }
+
+    pthread_mutex_lock(&surfaceObj->mutex);
+    const uint8_t *srcY = srcBase + srcOffsetY + ((size_t) src_y * srcPitchY) + (size_t) src_x;
+    uint8_t *dstY = surfaceObj->hostData + ((size_t) dest_y * surfaceObj->hostPitch) + (size_t) dest_x;
+
+    for (uint32_t row = 0; row < copyH; row++) {
+        memcpy(dstY + ((size_t) row * surfaceObj->hostPitch),
+               srcY + ((size_t) row * srcPitchY),
+               copyW);
+    }
+
+    uint32_t srcXUV = (uint32_t) src_x & ~1U;
+    uint32_t dstXUV = (uint32_t) dest_x & ~1U;
+    uint32_t uvWidth = copyW & ~1U;
+    uint32_t uvHeight = copyH / 2U;
+    const uint8_t *srcUV = srcBase + srcOffsetUV +
+                           ((size_t) ((uint32_t) src_y / 2U) * srcPitchUV) + (size_t) srcXUV;
+    uint8_t *dstUV = surfaceObj->hostData + surfaceObj->hostYSize +
+                     ((size_t) ((uint32_t) dest_y / 2U) * surfaceObj->hostPitch) + (size_t) dstXUV;
+
+    for (uint32_t row = 0; row < uvHeight; row++) {
+        memcpy(dstUV + ((size_t) row * surfaceObj->hostPitch),
+               srcUV + ((size_t) row * srcPitchUV),
+               uvWidth);
+    }
+
+    if (copyW > 0 && copyH > 0) {
+        uint32_t rx = (uint32_t) dest_x;
+        uint32_t ry = (uint32_t) dest_y;
+        uint32_t rw = copyW;
+        uint32_t rh = copyH;
+
+        if (!surfaceObj->contentValid) {
+            surfaceObj->contentX = rx;
+            surfaceObj->contentY = ry;
+            surfaceObj->contentWidth = rw;
+            surfaceObj->contentHeight = rh;
+            surfaceObj->contentValid = 1;
+        } else {
+            uint32_t x0 = surfaceObj->contentX < rx ? surfaceObj->contentX : rx;
+            uint32_t y0 = surfaceObj->contentY < ry ? surfaceObj->contentY : ry;
+            uint32_t x1a = surfaceObj->contentX + surfaceObj->contentWidth;
+            uint32_t y1a = surfaceObj->contentY + surfaceObj->contentHeight;
+            uint32_t x1b = rx + rw;
+            uint32_t y1b = ry + rh;
+            uint32_t x1 = x1a > x1b ? x1a : x1b;
+            uint32_t y1 = y1a > y1b ? y1a : y1b;
+            if (x1 > surfaceObj->width) {
+                x1 = surfaceObj->width;
+            }
+            if (y1 > surfaceObj->height) {
+                y1 = surfaceObj->height;
+            }
+            surfaceObj->contentX = x0;
+            surfaceObj->contentY = y0;
+            surfaceObj->contentWidth = x1 > x0 ? (x1 - x0) : 0;
+            surfaceObj->contentHeight = y1 > y0 ? (y1 - y0) : 0;
+            surfaceObj->contentValid = (surfaceObj->contentWidth > 0 && surfaceObj->contentHeight > 0) ? 1 : 0;
+        }
+    }
+    pthread_mutex_unlock(&surfaceObj->mutex);
+
+    surfaceObj->status = VASurfaceReady;
     return VA_STATUS_SUCCESS;
 }
 
@@ -1872,6 +3514,40 @@ static VAStatus nvQuerySurfaceAttributes(
         return VA_STATUS_ERROR_INVALID_CONFIG;
     }
 
+    if (cfg->isEncode) {
+        if (num_attribs) {
+            *num_attribs = 5;
+        }
+        if (!attrib_list) {
+            return VA_STATUS_SUCCESS;
+        }
+        attrib_list[0].type = VASurfaceAttribMinWidth;
+        attrib_list[0].flags = 0;
+        attrib_list[0].value.type = VAGenericValueTypeInteger;
+        attrib_list[0].value.value.i = 48;
+
+        attrib_list[1].type = VASurfaceAttribMinHeight;
+        attrib_list[1].flags = 0;
+        attrib_list[1].value.type = VAGenericValueTypeInteger;
+        attrib_list[1].value.value.i = 16;
+
+        attrib_list[2].type = VASurfaceAttribMaxWidth;
+        attrib_list[2].flags = 0;
+        attrib_list[2].value.type = VAGenericValueTypeInteger;
+        attrib_list[2].value.value.i = 8192;
+
+        attrib_list[3].type = VASurfaceAttribMaxHeight;
+        attrib_list[3].flags = 0;
+        attrib_list[3].value.type = VAGenericValueTypeInteger;
+        attrib_list[3].value.value.i = 8192;
+
+        attrib_list[4].type = VASurfaceAttribPixelFormat;
+        attrib_list[4].flags = 0;
+        attrib_list[4].value.type = VAGenericValueTypeInteger;
+        attrib_list[4].value.value.i = VA_FOURCC_NV12;
+        return VA_STATUS_SUCCESS;
+    }
+
     //LOG("with %d (%d) %p %d", cfg->cudaCodec, cfg->bitDepth, attrib_list, *num_attribs);
 
     if (cfg->chromaFormat != cudaVideoChromaFormat_420 && cfg->chromaFormat != cudaVideoChromaFormat_444) {
@@ -1997,9 +3673,20 @@ static VAStatus nvBufferInfo(
            unsigned int *num_elements /* out */
 )
 {
-    LOG("In %s", __func__);
-    *size=0;
-    *num_elements=0;
+    NVDriver *drv = (NVDriver*) ctx->pDriverData;
+    NVBuffer *buf = (NVBuffer*) getObjectPtr(drv, OBJECT_TYPE_BUFFER, buf_id);
+    if (!buf) {
+        return VA_STATUS_ERROR_INVALID_BUFFER;
+    }
+    if (type) {
+        *type = buf->bufferType;
+    }
+    if (size) {
+        *size = buf->size;
+    }
+    if (num_elements) {
+        *num_elements = buf->elements;
+    }
 
     return VA_STATUS_SUCCESS;
 }
@@ -2042,8 +3729,24 @@ static VAStatus nvLockSurface(
                        */
 )
 {
-    LOG("In %s", __func__);
-    return VA_STATUS_ERROR_UNIMPLEMENTED;
+    NVDriver *drv = (NVDriver*) ctx->pDriverData;
+    NVSurface *surf = (NVSurface*) getObjectPtr(drv, OBJECT_TYPE_SURFACE, surface);
+    if (!surf) {
+        return VA_STATUS_ERROR_INVALID_SURFACE;
+    }
+    if (!ensureSurfaceHostBuffer(surf)) {
+        return VA_STATUS_ERROR_ALLOCATION_FAILED;
+    }
+    if (fourcc) *fourcc = VA_FOURCC_NV12;
+    if (luma_stride) *luma_stride = (unsigned int) surf->hostPitch;
+    if (chroma_u_stride) *chroma_u_stride = (unsigned int) surf->hostPitch;
+    if (chroma_v_stride) *chroma_v_stride = (unsigned int) surf->hostPitch;
+    if (luma_offset) *luma_offset = 0;
+    if (chroma_u_offset) *chroma_u_offset = (unsigned int) surf->hostYSize;
+    if (chroma_v_offset) *chroma_v_offset = (unsigned int) (surf->hostYSize + 1);
+    if (buffer_name) *buffer_name = 0;
+    if (buffer) *buffer = surf->hostData;
+    return VA_STATUS_SUCCESS;
 }
 
 static VAStatus nvUnlockSurface(
@@ -2051,8 +3754,12 @@ static VAStatus nvUnlockSurface(
                 VASurfaceID surface
         )
 {
-    LOG("In %s", __func__);
-    return VA_STATUS_ERROR_UNIMPLEMENTED;
+    NVDriver *drv = (NVDriver*) ctx->pDriverData;
+    NVSurface *surf = (NVSurface*) getObjectPtr(drv, OBJECT_TYPE_SURFACE, surface);
+    if (!surf) {
+        return VA_STATUS_ERROR_INVALID_SURFACE;
+    }
+    return VA_STATUS_SUCCESS;
 }
 
 static VAStatus nvCreateMFContext(
@@ -2187,6 +3894,10 @@ static VAStatus nvTerminate( VADriverContextP ctx )
 
     CHECK_CUDA_RESULT_RETURN(cu->cuCtxDestroy(drv->cudaContext), VA_STATUS_ERROR_OPERATION_FAILED);
     drv->cudaContext = NULL;
+    if (drv->nvencLib) {
+        dlclose(drv->nvencLib);
+        drv->nvencLib = NULL;
+    }
 
     free(drv);
 
@@ -2312,17 +4023,11 @@ VAStatus __vaDriverInit_1_0(VADriverContextP ctx) {
     }
 
     ctx->max_profiles = MAX_PROFILES;
-    ctx->max_entrypoints = 1;
-    ctx->max_attributes = 1;
+    ctx->max_entrypoints = 3;
+    ctx->max_attributes = 16;
     ctx->max_display_attributes = 1;
     ctx->max_image_formats = ARRAY_SIZE(formatsInfo) - 1;
     ctx->max_subpic_formats = 1;
-
-    if (backend == DIRECT) {
-        ctx->str_vendor = "VA-API NVDEC driver [direct backend]";
-    } else if (backend == EGL) {
-        ctx->str_vendor = "VA-API NVDEC driver [egl backend]";
-    }
 
     pthread_mutexattr_t attrib;
     pthread_mutexattr_init(&attrib);
@@ -2343,9 +4048,34 @@ VAStatus __vaDriverInit_1_0(VADriverContextP ctx) {
         return VA_STATUS_ERROR_OPERATION_FAILED;
     }
 
+    if (!loadNvencFunctions(drv)) {
+        LOG("NVENC unavailable, continuing in decode-only mode");
+    }
+
+    if (backend == DIRECT) {
+        ctx->str_vendor = drv->nvencAvailable ?
+            "VA-API NVDEC/NVENC driver [direct backend]" :
+            "VA-API NVDEC driver [direct backend]";
+    } else if (backend == EGL) {
+        ctx->str_vendor = drv->nvencAvailable ?
+            "VA-API NVDEC/NVENC driver [egl backend]" :
+            "VA-API NVDEC driver [egl backend]";
+    }
+
     //CHECK_CUDA_RESULT_RETURN(cv->cuvidCtxLockCreate(&drv->vidLock, drv->cudaContext), VA_STATUS_ERROR_OPERATION_FAILED);
 
-    nvQueryConfigProfiles2(ctx, drv->profiles, &drv->profileCount);
+    VAStatus profileStatus = nvQueryConfigProfiles2(ctx, drv->profiles, &drv->profileCount);
+    if (profileStatus != VA_STATUS_SUCCESS) {
+        drv->profileCount = 0;
+    }
+
+    if (drv->nvencAvailable) {
+        appendProfileIfMissing(drv, VAProfileH264ConstrainedBaseline);
+        appendProfileIfMissing(drv, VAProfileH264Main);
+        appendProfileIfMissing(drv, VAProfileH264High);
+        appendProfileIfMissing(drv, VAProfileHEVCMain);
+        appendProfileIfMissing(drv, VAProfileHEVCMain10);
+    }
 
     *ctx->vtable = vtable;
     return VA_STATUS_SUCCESS;

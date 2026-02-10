@@ -6,7 +6,9 @@
 #include <EGL/egl.h>
 #include <EGL/eglext.h>
 #include <stdbool.h>
+#include <stdint.h>
 #include <va/va_drmcommon.h>
+#include <ffnvcodec/nvEncodeAPI.h>
 
 #include <pthread.h>
 #include "list.h"
@@ -46,6 +48,13 @@ typedef struct
     VABufferType    bufferType;
     void            *ptr;
     size_t          offset;
+    bool            ownsPtr;
+    VACodedBufferSegment *codedSeg;
+    uint8_t         *codedData;
+    size_t          codedCapacity;
+    VASurfaceID     surfaceId;
+    int             commitOnUnmap;
+    int             mappedSurfaceLock;
 } NVBuffer;
 
 struct _NVContext;
@@ -69,6 +78,17 @@ typedef struct
     pthread_mutex_t         mutex;
     pthread_cond_t          cond;
     bool                    decodeFailed;
+    // host-side NV12 staging for VAAPI encode path
+    uint8_t                 *hostData;
+    size_t                  hostPitch;
+    size_t                  hostYSize;
+    size_t                  hostTotalSize;
+    uint32_t                contentX;
+    uint32_t                contentY;
+    uint32_t                contentWidth;
+    uint32_t                contentHeight;
+    int                     contentValid;
+    VASurfaceStatus         status;
 } NVSurface;
 
 typedef enum
@@ -87,6 +107,9 @@ typedef struct
     uint32_t    width;
     uint32_t    height;
     NVFormat    format;
+    uint32_t    numPlanes;
+    uint32_t    pitches[3];
+    uint32_t    offsets[3];
     NVBuffer    *imageBuffer;
 } NVImage;
 
@@ -129,6 +152,9 @@ typedef struct _NVDriver
 {
     CudaFunctions           *cu;
     CuvidFunctions          *cv;
+    void                    *nvencLib;
+    NV_ENCODE_API_FUNCTION_LIST nvencFuncs;
+    bool                    nvencAvailable;
     CUcontext               cudaContext;
     CUvideoctxlock          vidLock;
     Array/*<Object>*/       objects;
@@ -158,9 +184,16 @@ typedef struct _NVDriver
 
 struct _NVCodec;
 
+typedef enum
+{
+    NV_CONTEXT_DECODE = 0,
+    NV_CONTEXT_ENCODE = 1
+} NVContextMode;
+
 typedef struct _NVContext
 {
     NVDriver            *drv;
+    NVContextMode       mode;
     VAProfile           profile;
     VAEntrypoint        entrypoint;
     uint32_t            width;
@@ -184,6 +217,30 @@ typedef struct _NVContext
     pthread_mutex_t     surfaceCreationMutex;
     int                 surfaceCount;
     bool                firstKeyframeValid;
+    // encode state (valid when mode == NV_CONTEXT_ENCODE)
+    void                *nvencEncoder;
+    NV_ENC_INPUT_PTR    nvencInputBuffer;
+    NV_ENC_OUTPUT_PTR   nvencOutputBuffer;
+    GUID                encCodecGuid;
+    GUID                encProfileGuid;
+    GUID                encPresetGuid;
+    int                 encIsHevc;
+    NV_ENC_CONFIG       encConfig;
+    NV_ENC_INITIALIZE_PARAMS encInitParams;
+    int                 encNeedsReconfigure;
+    VASurfaceID         encCurrentSurface;
+    VABufferID          encCodedBufId;
+    int                 encHasCodedBuf;
+    int                 encForceIdr;
+    uint32_t            encFrameNum;
+    uint32_t            encVisibleX;
+    uint32_t            encVisibleY;
+    uint32_t            encVisibleWidth;
+    uint32_t            encVisibleHeight;
+    int                 encVisibleValid;
+    uint8_t             *encLastFrameData;
+    size_t              encLastFrameSize;
+    int                 encLastFrameValid;
 } NVContext;
 
 typedef struct
@@ -194,6 +251,8 @@ typedef struct
     cudaVideoChromaFormat   chromaFormat;
     int                     bitDepth;
     cudaVideoCodec          cudaCodec;
+    bool                    isEncode;
+    uint32_t                encodeRCMode;
 } NVConfig;
 
 typedef void (*HandlerFunc)(NVContext*, NVBuffer* , CUVIDPICPARAMS*);

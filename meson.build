@@ -78,7 +78,7 @@ shared_library(
     name_prefix: '',
     sources: sources,
     dependencies: deps,
-    include_directories: nvidia_incdir,
+    include_directories: [nvidia_incdir],
     install: true,
     install_dir: nvidia_install_dir,
     gnu_symbol_visibility: 'hidden',

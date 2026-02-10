@@ -1,6 +1,9 @@
 *.o
 samples/*.mp4
 subprojects/*/
+subprojects/.wraplock
+subprojects/packagecache/
+subprojects/nv-codec-headers-*/
 videos
 va-api-nvidia.cflags
 va-api-nvidia.config
@@ -11,3 +14,6 @@ va-api-nvidia.files
 va-api-nvidia.includes
 meson.build.user
 .idea
+build/
+build_*/
+*.log

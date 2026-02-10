@@ -505,6 +505,7 @@ static bool copyFrameToSurface(NVDriver *drv, CUdeviceptr ptr, NVSurface *surfac
 
     //notify anyone waiting for us to be resolved
     pthread_mutex_lock(&surface->mutex);
+    surface->status = VASurfaceReady;
     surface->resolving = 0;
     pthread_cond_signal(&surface->cond);
     pthread_mutex_unlock(&surface->mutex);
