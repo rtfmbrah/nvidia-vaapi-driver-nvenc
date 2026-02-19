@@ -618,6 +618,10 @@ static VAStatus nvGetConfigAttributes(
         int num_attribs
     )
 {
+    if (entrypoint != VAEntrypointVLD) {
+        return VA_STATUS_ERROR_UNSUPPORTED_ENTRYPOINT;
+    }
+
     NVDriver *drv = (NVDriver*) ctx->pDriverData;
     if (vaToCuCodec(profile) == cudaVideoCodec_NONE) {
         return VA_STATUS_ERROR_UNSUPPORTED_PROFILE;
