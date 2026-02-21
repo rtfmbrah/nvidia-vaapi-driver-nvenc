@@ -1334,6 +1334,10 @@ static VAStatus nvGetConfigAttributes(
         int num_attribs
     )
 {
+    if (entrypoint != VAEntrypointVLD) {
+        return VA_STATUS_ERROR_UNSUPPORTED_ENTRYPOINT;
+    }
+
     NVDriver *drv = (NVDriver*) ctx->pDriverData;
     if (g_disableDecoder && entrypoint == VAEntrypointVLD) {
         return VA_STATUS_ERROR_UNSUPPORTED_ENTRYPOINT;
